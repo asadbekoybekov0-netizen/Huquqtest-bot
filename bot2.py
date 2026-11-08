@@ -48,7 +48,7 @@ DB_PATH = os.getenv("DB_PATH", "tests2.db")
 CACHE_DIR = os.getenv("CACHE_DIR", "filecache")
 
 PENALTY = 1  # har bir chiqib ketish uchun ayriladigan ball
-GRACE = 5  # shuncha soniyadan qisqa uzilish jarima emas (bildirishnoma va h.k.)
+GRACE = 2  # shuncha soniyadan qisqa uzilish jarima emas (bildirishnoma va h.k.)
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 # ----------------------------- BAZA -----------------------------
