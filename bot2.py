@@ -48,7 +48,7 @@ DB_PATH = os.getenv("DB_PATH", "tests2.db")
 CACHE_DIR = os.getenv("CACHE_DIR", "filecache")
 
 PENALTY = 1  # har bir chiqib ketish uchun ayriladigan ball
-GRACE = 2  # shuncha soniyadan qisqa uzilish jarima emas (bildirishnoma va h.k.)
+GRACE = 1.5  # shuncha soniyadan qisqa uzilish jarima emas (bildirishnoma va h.k.)
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
 # ----------------------------- BAZA -----------------------------
@@ -190,18 +190,25 @@ async def conclude(bot: Bot, code: str, uid: int, prefix: str = "") -> dict:
     return res
 
 
-async def timer_task(bot: Bot, code: str, uid: int, delay: float):
-    if delay > 120:
-        await asyncio.sleep(delay - 60)
-        att = get_attempt(code, uid)
-        if att and not att["finished"]:
+async def timer_task(bot: Bot, code: str, uid: int, delay: float = 0):
+    """Tugash vaqtini doim bazadan qayta tekshiradi (vaqt uzaytirilishi mumkin)."""
+    warned = False
+    while True:
+        att, test = get_attempt(code, uid), get_test(code)
+        if not att or att["finished"]:
+            return
+        left = time_left(test, att)
+        if left <= 0:
+            break
+        if left > 70:
+            warned = False
+        if left <= 60 and not warned and test["minutes"] * 60 > 120:
+            warned = True
             try:
                 await bot.send_message(uid, "⏰ Vaqtning tugashiga 1 daqiqa qoldi!")
             except Exception:
                 pass
-        await asyncio.sleep(60)
-    else:
-        await asyncio.sleep(max(delay, 0))
+        await asyncio.sleep(min(left - 60, 20) if left > 60 else min(left, 5))
     att = get_attempt(code, uid)
     if att and not att["finished"]:
         await conclude(bot, code, uid, "⌛ Vaqt tugadi.\n\n")
@@ -417,6 +424,23 @@ async def api_submit(request):
     return web.json_response({"result": res})
 
 
+async def api_sync(request):
+    d = await read_body(request)
+    uid, _ = auth(d)
+    code = str(d.get("code", "")).upper()
+    test, att = get_test(code), get_attempt(code, uid)
+    if not test or not att:
+        raise web.HTTPNotFound(text="Topilmadi")
+    if att["finished"]:
+        res, _ = finalize(code, uid)
+        return web.json_response({"finished": True, "result": res})
+    left = time_left(test, att)
+    if left <= 0:
+        res = await conclude(request.app["bot"], code, uid, "⌛ Vaqt tugadi.\n\n")
+        return web.json_response({"finished": True, "result": res})
+    return web.json_response({"finished": False, "left": left})
+
+
 async def health(request):
     return web.Response(text="OK")
 
@@ -440,6 +464,7 @@ def make_web(bot: Bot) -> web.Application:
             web.post("/api/leave", api_leave),
             web.post("/api/back", api_back),
             web.post("/api/submit", api_submit),
+            web.post("/api/sync", api_sync),
         ]
     )
     return app
@@ -557,12 +582,24 @@ function fmt(s) {
 }
 function setPen(p) { $("pen").textContent = p > 0 ? ("🚪 Jarima: -" + p) : "⚠️ Ilovadan chiqsangiz -1 ball"; }
 
+let checking = false;
+async function checkEnd() {
+  if (checking || finished) return;
+  checking = true;
+  try {
+    const r = await api("/api/sync");
+    if (r.finished) showResult(r.result);
+    else endAt = Date.now() + r.left * 1000;
+  } catch (e) {}
+  checking = false;
+}
+
 function tick() {
   if (finished) return;
   const left = (endAt - Date.now()) / 1000;
   $("timer").textContent = fmt(left);
   $("timer").classList.toggle("low", left < 60);
-  if (left <= 0) submit(true);
+  if (left <= 0) checkEnd();
 }
 
 function updateCount() {
@@ -629,12 +666,18 @@ async function loadDoc() {
   }
 }
 
+let curTab = "doc";
+const scrollPos = {doc: 0, ans: 0};
 function setTab(t) {
+  if (t === curTab) return;
+  scrollPos[curTab] = window.scrollY;
+  curTab = t;
   $("v-doc").classList.toggle("hidden", t !== "doc");
   $("v-ans").classList.toggle("hidden", t !== "ans");
   $("tab-doc").classList.toggle("on", t === "doc");
   $("tab-ans").classList.toggle("on", t === "ans");
-  window.scrollTo(0, 0);
+  window.scrollTo(0, scrollPos[t]);
+  requestAnimationFrame(() => window.scrollTo(0, scrollPos[t]));
 }
 $("tab-doc").onclick = () => setTab("doc");
 $("tab-ans").onclick = () => setTab("ans");
@@ -711,6 +754,16 @@ tg.onEvent("activated", comeBack);
   buildSheet();
   show("test");
   tick(); setInterval(tick, 1000);
+  setInterval(async () => {
+    if (finished || away) return;
+    try {
+      const r = await api("/api/sync");
+      if (r.finished) { showResult(r.result); return; }
+      const prev = endAt;
+      endAt = Date.now() + r.left * 1000;
+      if (endAt - prev > 20000) toast("⏱ Test vaqti uzaytirildi");
+    } catch (e) {}
+  }, 15000);
   loadDoc();
 })();
 </script>
@@ -869,6 +922,34 @@ async def show_test(m: Message, code: str):
         f"⏱ {test['minutes']} daqiqa\n\n{status}\n"
         f"⚠️ Ilovadan chiqsangiz -1 ball ayriladi.",
         reply_markup=kb,
+    )
+
+
+# ---------- Vaqtni uzaytirish (test egasi) ----------
+@router.message(Command("vaqt"))
+async def add_time(m: Message, command: CommandObject, bot: Bot):
+    args = (command.args or "").split()
+    if len(args) != 2 or not re.fullmatch(r"\d{1,3}", args[1]):
+        return await m.answer("Ishlatish: /vaqt KOD DAQIQA\nMasalan: <code>/vaqt AB12CD 5</code>")
+    code, add = args[0].upper(), int(args[1])
+    test = get_test(code)
+    if not test or test["owner_id"] != m.from_user.id:
+        return await m.answer("Test topilmadi yoki u sizniki emas.")
+    if not 1 <= add <= 180:
+        return await m.answer("1 dan 180 daqiqagacha kiriting.")
+    db.execute("UPDATE tests SET minutes=minutes+? WHERE code=?", (add, code))
+    db.commit()
+    rows = db.execute(
+        "SELECT user_id FROM attempts WHERE code=? AND finished=0", (code,)
+    ).fetchall()
+    for r in rows:
+        try:
+            await bot.send_message(r["user_id"], f"⏱ Test vaqti {add} daqiqaga uzaytirildi.")
+        except Exception:
+            pass
+    await m.answer(
+        f"✅ {add} daqiqa qo'shildi. Yangi umumiy vaqt: {test['minutes'] + add} daqiqa.\n"
+        f"Hozir yechayotganlar: {len(rows)} ta."
     )
 
 
