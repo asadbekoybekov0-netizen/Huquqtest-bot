@@ -33,6 +33,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -58,7 +59,7 @@ db.executescript(
     """
 CREATE TABLE IF NOT EXISTS tests(
     code TEXT PRIMARY KEY, owner_id INTEGER, title TEXT, file_id TEXT,
-    kind TEXT, answer_key TEXT, minutes INTEGER, created REAL);
+    kind TEXT, answer_key TEXT, minutes INTEGER, created REAL, body TEXT);
 CREATE TABLE IF NOT EXISTS attempts(
     code TEXT, user_id INTEGER, name TEXT, started REAL,
     finished INTEGER DEFAULT 0, correct INTEGER DEFAULT 0, total INTEGER DEFAULT 0,
@@ -67,6 +68,13 @@ CREATE TABLE IF NOT EXISTS attempts(
     PRIMARY KEY(code, user_id));
 """
 )
+
+
+try:  # eski bazalar uchun: matnli test ustuni
+    db.execute("ALTER TABLE tests ADD COLUMN body TEXT")
+    db.commit()
+except sqlite3.OperationalError:
+    pass
 
 
 def get_test(code):
@@ -316,6 +324,8 @@ async def api_start(request):
 
 
 async def get_file_bytes(bot: Bot, test) -> bytes:
+    if test["kind"] == "text":
+        return (test["body"] or "").encode("utf-8")
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, test["code"])
     if os.path.exists(path):
@@ -499,6 +509,7 @@ main{padding-bottom:90px}
 #doc canvas{display:block;margin:0 auto 6px}
 .docx{padding:14px;overflow-x:auto}
 .docx img{max-width:100%}
+.txt{white-space:pre-wrap;font-size:17px;line-height:1.55;word-wrap:break-word}
 .q{display:flex;align-items:center;gap:6px;padding:8px 12px;border-bottom:1px solid var(--sec)}
 .q b{width:36px}
 .o{flex:1;padding:10px 0;border-radius:10px;border:1px solid var(--hint);background:transparent;color:var(--tx);font-size:16px;text-transform:uppercase}
@@ -641,7 +652,11 @@ async function loadDoc() {
     if (!r.ok) throw new Error(await r.text());
     const buf = await r.arrayBuffer();
     doc.innerHTML = "";
-    if (S.kind === "pdf") {
+    if (S.kind === "text") {
+      const div = document.createElement("div"); div.className = "docx txt";
+      div.textContent = new TextDecoder("utf-8").decode(buf);
+      doc.appendChild(div);
+    } else if (S.kind === "pdf") {
       pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
       const pdf = await pdfjsLib.getDocument({data: new Uint8Array(buf)}).promise;
       const cssW = doc.clientWidth || window.innerWidth;
@@ -818,7 +833,10 @@ async def create_start(m: Message, state: FSMContext):
 async def create_title(m: Message, state: FSMContext):
     await state.update_data(title=m.text.strip()[:100])
     await state.set_state(Create.file)
-    await m.answer("Test faylini yuboring (<b>PDF</b> yoki <b>.docx</b>):")
+    await m.answer(
+        "Test faylini yuboring (<b>PDF</b> yoki <b>.docx</b>)\n"
+        "yoki testni <b>oddiy matn</b> qilib yozib yuboring (uzun bo'lsa, bir necha xabarga bo'lib yuborishingiz mumkin)."
+    )
 
 
 @router.message(Create.file, F.document)
@@ -846,9 +864,44 @@ async def create_file_step(m: Message, state: FSMContext):
     )
 
 
+@router.message(Create.file, F.text)
+async def create_text_part(m: Message, state: FSMContext):
+    data = await state.get_data()
+    parts = data.get("parts", [])
+    parts.append(m.text)
+    total = sum(len(x) for x in parts)
+    if total > 60000:
+        return await m.answer("❌ Matn juda uzun (60 000 belgidan oshmasin).")
+    await state.update_data(parts=parts)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✅ Tayyor", callback_data="text_done")]]
+    )
+    await m.answer(
+        f"📝 {len(parts)}-qism qabul qilindi (jami {total} belgi).\n"
+        "Yana matn yuborsangiz, davomiga qo'shiladi. Tugagach «✅ Tayyor» ni bosing.",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data == "text_done", Create.file)
+async def text_done(c: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    parts = data.get("parts", [])
+    if not parts:
+        return await c.answer("Avval matn yuboring", show_alert=True)
+    await state.update_data(kind="text", body="\n".join(parts), file_id="")
+    await state.set_state(Create.key)
+    await c.message.answer(
+        "Javoblar kalitini yuboring.\n\n"
+        "Misol: <code>abcdabcdab</code>\n"
+        "yoki: <code>1a 2b 3c 4d</code>"
+    )
+    await c.answer()
+
+
 @router.message(Create.file)
 async def create_file_wrong(m: Message):
-    await m.answer("Iltimos, fayl (PDF yoki .docx) yuboring.")
+    await m.answer("Iltimos, fayl (PDF yoki .docx) yoki oddiy matn yuboring.")
 
 
 @router.message(Create.key, F.text)
@@ -868,10 +921,10 @@ async def create_minutes(m: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     code = new_code()
     db.execute(
-        "INSERT INTO tests(code,owner_id,title,file_id,kind,answer_key,minutes,created) "
-        "VALUES(?,?,?,?,?,?,?,?)",
+        "INSERT INTO tests(code,owner_id,title,file_id,kind,answer_key,minutes,created,body) "
+        "VALUES(?,?,?,?,?,?,?,?,?)",
         (code, m.from_user.id, data["title"], data["file_id"], data["kind"],
-         data["key"], int(m.text), time.time()),
+         data["key"], int(m.text), time.time(), data.get("body")),
     )
     db.commit()
     await state.clear()
