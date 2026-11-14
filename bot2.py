@@ -143,6 +143,10 @@ def finalize(code: str, uid: int):
         "penalties": pen * PENALTY,
         "score": score,
         "wrong": wrong,
+        "items": [
+            {"q": n, "given": given.get(n, ""), "right": l}
+            for n, l in sorted(key.items())
+        ],
     }
     db.execute(
         "UPDATE attempts SET finished=1, correct=?, total=?, penalties=?, score=?, "
@@ -187,11 +191,21 @@ async def notify_owner(bot: Bot, code: str, uid: int):
         pass
 
 
+def review_kb(code: str):
+    if not WEBAPP_URL:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔍 Xatolarni tahlil qilish", web_app=WebAppInfo(url=f"{WEBAPP_URL}/app?code={code}"))]
+        ]
+    )
+
+
 async def conclude(bot: Bot, code: str, uid: int, prefix: str = "") -> dict:
     res, new = finalize(code, uid)
     if new:
         try:
-            await bot.send_message(uid, prefix + result_text(res))
+            await bot.send_message(uid, prefix + result_text(res), reply_markup=review_kb(code))
         except Exception:
             pass
         await notify_owner(bot, code, uid)
@@ -281,7 +295,7 @@ async def api_start(request):
     att = get_attempt(code, uid)
     if att and att["finished"]:
         res, _ = finalize(code, uid)
-        return web.json_response({"finished": True, "result": res})
+        return web.json_response({"finished": True, "result": res, "kind": test["kind"]})
 
     new = att is None
     if new:
@@ -302,7 +316,7 @@ async def api_start(request):
     left = time_left(test, att)
     if left <= 0:
         res = await conclude(bot, code, uid, "⌛ Vaqt tugadi.\n\n")
-        return web.json_response({"finished": True, "result": res})
+        return web.json_response({"finished": True, "result": res, "kind": test["kind"]})
     if new:
         asyncio.create_task(timer_task(bot, code, uid, left))
 
@@ -344,7 +358,7 @@ async def api_file(request):
     uid, _ = auth(d)
     code = str(d.get("code", "")).upper()
     test, att = get_test(code), get_attempt(code, uid)
-    if not test or not att or att["finished"]:
+    if not test or not att:
         raise web.HTTPForbidden(text="Ruxsat yo'q")
     data = await get_file_bytes(request.app["bot"], test)
     return web.Response(body=data, content_type="application/octet-stream")
@@ -505,8 +519,9 @@ header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px so
 .tab{flex:1;padding:8px;border-radius:10px;border:0;background:var(--sec);color:var(--tx);font-size:15px}
 .tab.on{background:var(--btn);color:var(--btx)}
 main{padding-bottom:90px}
-#doc{background:#fff;color:#000;min-height:200px}
-#doc canvas{display:block;margin:0 auto 6px}
+#doc,#doc2{background:#fff;color:#000;min-height:200px}
+#doc canvas,#doc2 canvas{display:block;margin:0 auto 6px}
+.q.bad{background:rgba(229,57,53,.10)}
 .docx{padding:14px;overflow-x:auto}
 .docx img{max-width:100%}
 .txt{white-space:pre-wrap;font-size:17px;line-height:1.55;word-wrap:break-word}
@@ -536,7 +551,7 @@ footer{position:fixed;left:0;right:0;bottom:0;background:var(--bg);border-top:1p
     </div>
   </header>
   <main>
-    <div id="v-doc"><div id="doc"><div class="center" style="color:#666">Fayl yuklanmoqda...</div></div></div>
+    <div id="v-doc"><div id="doc" class="docwrap"><div class="center" style="color:#666">Fayl yuklanmoqda...</div></div></div>
     <div id="v-ans" class="hidden"></div>
   </main>
   <footer><button class="big" id="finish">✅ Yakunlash</button></footer>
@@ -551,7 +566,25 @@ footer{position:fixed;left:0;right:0;bottom:0;background:var(--bg);border-top:1p
     <p>🏆 Yakuniy ball: <b id="r-score"></b></p>
   </div>
   <div class="card" id="r-wrongbox"><h2>❌ Xatolar</h2><div id="r-wrong"></div></div>
-  <div style="padding:0 16px 30px"><button class="big" id="closebtn">Yopish</button></div>
+  <div style="padding:0 16px 10px"><button class="big" id="revbtn">🔍 Xatolarni tahlil qilish</button></div>
+  <div style="padding:0 16px 30px"><button class="big" id="closebtn" style="background:var(--sec);color:var(--tx)">Yopish</button></div>
+</div>
+
+<div id="s-rev" class="hidden">
+  <header>
+    <div class="r1">
+      <button class="tab" id="rev-back" style="flex:none;padding:8px 12px">← Natija</button>
+      <div style="font-weight:600">Xatolar tahlili</div>
+    </div>
+    <div class="tabs">
+      <button class="tab on" id="rt-ans">📋 Javoblar</button>
+      <button class="tab" id="rt-doc">📄 Test</button>
+    </div>
+  </header>
+  <main style="padding-bottom:20px">
+    <div id="rv-ans"></div>
+    <div id="rv-doc" class="hidden"><div id="doc2" class="docwrap"><div class="center" style="color:#666">Fayl yuklanmoqda...</div></div></div>
+  </main>
 </div>
 
 <div id="toast" class="hidden"></div>
@@ -580,7 +613,7 @@ async function api(path, extra) {
   return r.json();
 }
 function show(name) {
-  ["load", "test", "res"].forEach(n => $("s-" + n).classList.toggle("hidden", n !== name));
+  ["load", "test", "res", "rev"].forEach(n => $("s-" + n).classList.toggle("hidden", n !== name));
 }
 function toast(t) {
   const el = $("toast"); el.textContent = t; el.classList.remove("hidden");
@@ -645,8 +678,8 @@ function pick(q, l, row) {
   });
 }
 
-async function loadDoc() {
-  const doc = $("doc");
+async function loadDoc(doc) {
+  doc = doc || $("doc");
   try {
     const r = await post("/api/file");
     if (!r.ok) throw new Error(await r.text());
@@ -677,7 +710,7 @@ async function loadDoc() {
       doc.appendChild(div);
     }
   } catch (e) {
-    doc.innerHTML = '<div class="center" style="color:#c00">Faylni ochib bo\'lmadi.<br><br><button class="big" onclick="loadDoc()">Qayta urinish</button></div>';
+    doc.innerHTML = '<div class="center" style="color:#c00">Faylni ochib bo\'lmadi.<br><br><button class="big" onclick="loadDoc(this.closest(&quot;.docwrap&quot;))">Qayta urinish</button></div>';
   }
 }
 
@@ -697,8 +730,10 @@ function setTab(t) {
 $("tab-doc").onclick = () => setTab("doc");
 $("tab-ans").onclick = () => setTab("ans");
 
+let RES = null, revDocLoaded = false;
 function showResult(r) {
   finished = true;
+  RES = r;
   try { tg.disableClosingConfirmation(); } catch (e) {}
   $("r-title").textContent = r.title;
   $("r-main").textContent = r.correct + "/" + r.total;
@@ -728,6 +763,34 @@ async function submit(auto) {
   });
 }
 $("finish").onclick = () => submit(false);
+
+/* ---- Xatolar tahlili ---- */
+function openReview() {
+  const box = $("rv-ans"); box.innerHTML = "";
+  const items = RES.items || RES.wrong;
+  items.forEach(x => {
+    const ok = x.given === x.right;
+    const row = document.createElement("div"); row.className = "q" + (ok ? "" : " bad");
+    const n = document.createElement("b"); n.textContent = x.q + ".";
+    const t = document.createElement("div"); t.style.flex = "1";
+    t.textContent = (ok ? "✅ " : "❌ ") + "Siz: " + (x.given ? x.given.toUpperCase() : "—") +
+      (ok ? "" : "   →   To'g'ri: " + x.right.toUpperCase());
+    row.appendChild(n); row.appendChild(t); box.appendChild(row);
+  });
+  show("rev"); setRevTab("ans");
+}
+function setRevTab(t) {
+  $("rv-ans").classList.toggle("hidden", t !== "ans");
+  $("rv-doc").classList.toggle("hidden", t !== "doc");
+  $("rt-ans").classList.toggle("on", t === "ans");
+  $("rt-doc").classList.toggle("on", t === "doc");
+  if (t === "doc" && !revDocLoaded) { revDocLoaded = true; loadDoc($("doc2")); }
+  window.scrollTo(0, 0);
+}
+$("revbtn").onclick = openReview;
+$("rev-back").onclick = () => show("res");
+$("rt-ans").onclick = () => setRevTab("ans");
+$("rt-doc").onclick = () => setRevTab("doc");
 $("closebtn").onclick = () => tg.close();
 
 /* ---- Ilovadan chiqishni aniqlash ---- */
@@ -961,7 +1024,10 @@ async def show_test(m: Message, code: str):
     att = get_attempt(code, uid)
     if att and att["finished"]:
         res, _ = finalize(code, uid)
-        return await m.answer("Siz bu testni allaqachon yechib bo'lgansiz.\n\n" + result_text(res))
+        return await m.answer(
+            "Siz bu testni allaqachon yechib bo'lgansiz.\n\n" + result_text(res),
+            reply_markup=review_kb(code),
+        )
     if not WEBAPP_URL:
         return await m.answer("⚠️ WEBAPP_URL sozlanmagan. Bot egasiga xabar bering.")
     kb = InlineKeyboardMarkup(
