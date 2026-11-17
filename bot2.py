@@ -59,7 +59,7 @@ db.executescript(
     """
 CREATE TABLE IF NOT EXISTS tests(
     code TEXT PRIMARY KEY, owner_id INTEGER, title TEXT, file_id TEXT,
-    kind TEXT, answer_key TEXT, minutes INTEGER, created REAL, body TEXT);
+    kind TEXT, answer_key TEXT, minutes INTEGER, created REAL, body TEXT, questions TEXT);
 CREATE TABLE IF NOT EXISTS attempts(
     code TEXT, user_id INTEGER, name TEXT, started REAL,
     finished INTEGER DEFAULT 0, correct INTEGER DEFAULT 0, total INTEGER DEFAULT 0,
@@ -70,11 +70,12 @@ CREATE TABLE IF NOT EXISTS attempts(
 )
 
 
-try:  # eski bazalar uchun: matnli test ustuni
-    db.execute("ALTER TABLE tests ADD COLUMN body TEXT")
-    db.commit()
-except sqlite3.OperationalError:
-    pass
+for _col in ("body", "questions"):  # eski bazalar uchun yangi ustunlar
+    try:
+        db.execute(f"ALTER TABLE tests ADD COLUMN {_col} TEXT")
+        db.commit()
+    except sqlite3.OperationalError:
+        pass
 
 
 def get_test(code):
@@ -95,6 +96,48 @@ def parse_answers(text: str) -> dict:
     if pairs:
         return {int(n): l for n, l in pairs}
     return {i + 1: l for i, l in enumerate(re.findall(r"[a-z]", text))}
+
+
+Q_RE = re.compile(r"^\s*(\d{1,3})\s*[.)]\s*(.*\S.*)$")
+O_RE = re.compile(r"^\s*\(?([A-Za-z])\)?\s*[).:]\s*(.*\S.*)$")
+
+
+def parse_quiz(text: str):
+    """'1. Savol / A) variant ...' matnini tuzilgan savollar ro'yxatiga aylantiradi."""
+    qs, cur, last = [], None, None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        mq = Q_RE.match(line)
+        # yangi savol: raqami ketma-ket va oldingi savolda kamida 2 ta variant bor
+        if mq and int(mq.group(1)) == len(qs) + 1 and (cur is None or len(cur["o"]) >= 2):
+            cur = {"q": len(qs) + 1, "t": mq.group(2).strip(), "o": {}}
+            qs.append(cur)
+            last = "q"
+            continue
+        if cur is None:
+            continue
+        mo = O_RE.match(line)
+        if mo:
+            expect = chr(ord("a") + len(cur["o"]))
+            if mo.group(1).lower() == expect:
+                cur["o"][expect] = mo.group(2).strip()
+                last = expect
+                continue
+        if last == "q":
+            cur["t"] += "\n" + line
+        elif last:
+            cur["o"][last] += " " + line
+    if not qs or any(len(q["o"]) < 2 for q in qs):
+        return None
+    return qs
+
+
+def qdata_for(test):
+    if test["kind"] != "quiz" or not test["questions"]:
+        return None
+    return json.loads(test["questions"])
 
 
 def encode_key(d: dict) -> str:
@@ -295,7 +338,7 @@ async def api_start(request):
     att = get_attempt(code, uid)
     if att and att["finished"]:
         res, _ = finalize(code, uid)
-        return web.json_response({"finished": True, "result": res, "kind": test["kind"]})
+        return web.json_response({"finished": True, "result": res, "kind": test["kind"], "qdata": qdata_for(test)})
 
     new = att is None
     if new:
@@ -316,7 +359,7 @@ async def api_start(request):
     left = time_left(test, att)
     if left <= 0:
         res = await conclude(bot, code, uid, "⌛ Vaqt tugadi.\n\n")
-        return web.json_response({"finished": True, "result": res, "kind": test["kind"]})
+        return web.json_response({"finished": True, "result": res, "kind": test["kind"], "qdata": qdata_for(test)})
     if new:
         asyncio.create_task(timer_task(bot, code, uid, left))
 
@@ -328,6 +371,7 @@ async def api_start(request):
             "finished": False,
             "title": test["title"],
             "kind": test["kind"],
+            "qdata": qdata_for(test),
             "questions": sorted(key.keys()),
             "options": options,
             "left": left,
@@ -338,7 +382,7 @@ async def api_start(request):
 
 
 async def get_file_bytes(bot: Bot, test) -> bytes:
-    if test["kind"] == "text":
+    if test["kind"] in ("text", "quiz"):
         return (test["body"] or "").encode("utf-8")
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, test["code"])
@@ -522,6 +566,38 @@ main{padding-bottom:90px}
 #doc,#doc2{background:#fff;color:#000;min-height:200px}
 #doc canvas,#doc2 canvas{display:block;margin:0 auto 6px}
 .q.bad{background:rgba(229,57,53,.10)}
+.qwrap{background:#f5f6fb;color:#151a4a;min-height:100vh;padding:14px 14px 40px}
+.qhead{background:#161a4d;color:#fff;border-radius:16px;padding:12px 14px;display:flex;justify-content:space-between;gap:10px;font-size:14px;box-shadow:0 6px 16px rgba(22,26,77,.25)}
+.qhead div{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qrow{display:flex;justify-content:space-between;align-items:center;margin:14px 2px 6px;gap:10px}
+.qtitle{font-weight:700;font-size:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.qtimer{background:#fff;border:1px solid #e3e5f0;border-radius:999px;padding:8px 14px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.qtimer.low{color:#e53935;border-color:#e53935}
+.qwarn{font-size:13px;color:#8a8fb0;margin:0 2px 10px}
+.qbar{height:8px;background:#e8eaf5;border-radius:99px;overflow:hidden;margin-bottom:14px}
+.qbar i{display:block;height:100%;background:#5b67e8;border-radius:99px;width:0;transition:width .25s}
+.qcard{background:#fff;border-radius:22px;padding:20px 16px;box-shadow:0 8px 24px rgba(30,36,100,.08)}
+.qnum{color:#5b67e8;font-weight:600;font-size:14px;margin-bottom:8px}
+.qtext{font-weight:700;font-size:18px;line-height:1.45;white-space:pre-wrap;word-wrap:break-word;margin-bottom:16px}
+.opt{display:flex;align-items:center;gap:12px;width:100%;text-align:left;background:#fff;border:2px solid #e3e5f0;border-radius:18px;padding:12px 14px;margin-bottom:10px;font-size:16px;color:#151a4a;font-family:inherit}
+.opt.sel{border-color:#5b67e8;background:#eef0ff}
+.opt.good{border-color:#4db35a;background:#e8f7ea}
+.opt.bad{border-color:#e53935;background:#fdeaea}
+.ol{flex:none;width:34px;height:34px;border-radius:50%;background:#eceef8;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px}
+.opt.sel .ol{background:#5b67e8;color:#fff}
+.opt.good .ol{background:#4db35a;color:#fff}
+.opt.bad .ol{background:#e53935;color:#fff}
+.ot{flex:1;white-space:pre-wrap;word-wrap:break-word}
+.qnav{display:flex;justify-content:space-between;margin-top:14px}
+.nbtn{padding:12px 22px;border-radius:999px;border:1px solid #e3e5f0;background:#fff;color:#151a4a;font-size:16px;font-weight:600}
+.nbtn:disabled{opacity:.4}
+.nbtn.pri{background:#5b67e8;color:#fff;border:0;box-shadow:0 8px 18px rgba(91,103,232,.35)}
+.qgrid{display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin:18px 0 12px}
+.gn{aspect-ratio:1;border-radius:12px;border:1px solid #e3e5f0;background:#fff;color:#151a4a;font-weight:600;font-size:14px;padding:0}
+.gn.done{background:#5cc36a;border-color:#4db35a;color:#fff}
+.gn.cur{background:#161a4d;border-color:#161a4d;color:#fff}
+.qleg{font-size:13px;color:#6a6f94;display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center}
+.qleg i{display:inline-block;width:12px;height:12px;border-radius:4px;margin-right:4px;vertical-align:-1px}
 .docx{padding:14px;overflow-x:auto}
 .docx img{max-width:100%}
 .txt{white-space:pre-wrap;font-size:17px;line-height:1.55;word-wrap:break-word}
@@ -555,6 +631,22 @@ footer{position:fixed;left:0;right:0;bottom:0;background:var(--bg);border-top:1p
     <div id="v-ans" class="hidden"></div>
   </main>
   <footer><button class="big" id="finish">✅ Yakunlash</button></footer>
+</div>
+
+<div id="s-quiz" class="hidden qwrap">
+  <div class="qhead"><div id="q-user"></div><div id="q-id"></div></div>
+  <div class="qrow"><div class="qtitle" id="q-title"></div><div class="qtimer" id="qtimer">--:--</div></div>
+  <div class="qwarn" id="qpen"></div>
+  <div class="qbar"><i id="q-bar"></i></div>
+  <div class="qcard">
+    <div class="qnum" id="q-num"></div>
+    <div class="qtext" id="q-text"></div>
+    <div id="q-opts"></div>
+    <div class="qnav"><button class="nbtn" id="q-prev">Oldingi</button><button class="nbtn pri" id="q-next">Keyingi</button></div>
+  </div>
+  <div class="qgrid" id="q-grid"></div>
+  <div class="qleg"><b id="q-count"></b><span>javob berildi</span><span><i style="background:#5cc36a"></i>Javob berilgan</span><span><i style="background:#161a4d"></i>Hozirgi savol</span><span><i style="background:#fff;border:1px solid #e3e5f0"></i>Javobsiz</span></div>
+  <div style="margin-top:18px"><button class="big" id="q-finish">✅ Testni yakunlash</button></div>
 </div>
 
 <div id="s-res" class="hidden">
@@ -613,7 +705,7 @@ async function api(path, extra) {
   return r.json();
 }
 function show(name) {
-  ["load", "test", "res", "rev"].forEach(n => $("s-" + n).classList.toggle("hidden", n !== name));
+  ["load", "test", "quiz", "res", "rev"].forEach(n => $("s-" + n).classList.toggle("hidden", n !== name));
 }
 function toast(t) {
   const el = $("toast"); el.textContent = t; el.classList.remove("hidden");
@@ -624,7 +716,10 @@ function fmt(s) {
   s = Math.max(0, Math.floor(s));
   return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
 }
-function setPen(p) { $("pen").textContent = p > 0 ? ("🚪 Jarima: -" + p) : "⚠️ Ilovadan chiqsangiz -1 ball"; }
+function setPen(p) {
+  const t = p > 0 ? ("🚪 Jarima: -" + p) : "⚠️ Ilovadan chiqsangiz -1 ball";
+  $("pen").textContent = t; $("qpen").textContent = t;
+}
 
 let checking = false;
 async function checkEnd() {
@@ -643,6 +738,8 @@ function tick() {
   const left = (endAt - Date.now()) / 1000;
   $("timer").textContent = fmt(left);
   $("timer").classList.toggle("low", left < 60);
+  $("qtimer").textContent = "⏱ " + fmt(left);
+  $("qtimer").classList.toggle("low", left < 60);
   if (left <= 0) checkEnd();
 }
 
@@ -757,15 +854,115 @@ async function submit(auto) {
   };
   if (auto) return go();
   ignoreAway = true;
-  tg.showConfirm("Testni yakunlaysizmi? Keyin javoblarni o'zgartirib bo'lmaydi.", ok => {
+  const total = S.questions ? S.questions.length : 0;
+  const rest = total - Object.keys(answers).length;
+  const msg = (rest > 0 ? rest + " ta savolga javob berilmagan. " : "") + "Testni yakunlaysizmi? Keyin o'zgartirib bo'lmaydi.";
+  tg.showConfirm(msg, ok => {
     ignoreAway = false;
     if (ok) go();
   });
 }
 $("finish").onclick = () => submit(false);
 
+/* ---- Savol-savol rejimi ---- */
+let cur = 0, QD = {};
+function isQuiz() { return !!(S && S.kind === "quiz" && S.qdata && S.qdata.length); }
+function qItem(q) {
+  const it = QD[q];
+  if (it) return it;
+  const o = {}; (S.options || ["a", "b", "c", "d"]).forEach(l => { o[l] = ""; });
+  return {q: q, t: "", o: o};
+}
+function optEl(tag, l, txt, cls) {
+  const d = document.createElement(tag); d.className = "opt" + (cls ? " " + cls : "");
+  const c = document.createElement("span"); c.className = "ol"; c.textContent = l.toUpperCase();
+  const t = document.createElement("span"); t.className = "ot"; t.textContent = txt;
+  d.appendChild(c); d.appendChild(t);
+  return d;
+}
+function buildQuiz() {
+  QD = {}; S.qdata.forEach(x => { QD[x.q] = x; });
+  const U = (tg.initDataUnsafe && tg.initDataUnsafe.user) || {};
+  $("q-user").textContent = "👤 " + ((U.first_name || "") + " " + (U.last_name || "")).trim();
+  $("q-id").textContent = U.id ? ("ID: " + U.id) : "";
+  $("q-title").textContent = S.title;
+  const first = S.questions.findIndex(n => !answers[n]);
+  cur = first >= 0 ? first : 0;
+  $("q-prev").onclick = () => { if (cur > 0) { cur--; renderQuiz(); window.scrollTo(0, 0); } };
+  $("q-next").onclick = () => {
+    if (cur < S.questions.length - 1) { cur++; renderQuiz(); window.scrollTo(0, 0); } else submit(false);
+  };
+  $("q-finish").onclick = () => submit(false);
+  renderQuiz();
+}
+function renderQuiz() {
+  const q = S.questions[cur], item = qItem(q);
+  $("q-num").textContent = (cur + 1) + "-savol / " + S.questions.length;
+  $("q-text").textContent = item.t;
+  const box = $("q-opts"); box.innerHTML = "";
+  Object.keys(item.o).forEach(l => {
+    const b = optEl("button", l, item.o[l], answers[q] === l ? "sel" : "");
+    b.onclick = () => choose(l);
+    box.appendChild(b);
+  });
+  $("q-prev").disabled = cur === 0;
+  $("q-next").textContent = cur === S.questions.length - 1 ? "Yakunlash" : "Keyingi";
+  const g = $("q-grid"); g.innerHTML = "";
+  S.questions.forEach((n, i) => {
+    const b = document.createElement("button");
+    b.className = "gn" + (answers[n] ? " done" : "") + (i === cur ? " cur" : "");
+    b.textContent = n;
+    b.onclick = () => { cur = i; renderQuiz(); window.scrollTo(0, 0); };
+    g.appendChild(b);
+  });
+  const done = Object.keys(answers).length;
+  $("q-count").textContent = done + " / " + S.questions.length;
+  $("q-bar").style.width = (done / S.questions.length * 100) + "%";
+}
+function choose(l) {
+  const q = S.questions[cur];
+  const nv = answers[q] === l ? "" : l;
+  if (nv) answers[q] = nv; else delete answers[q];
+  renderQuiz();
+  api("/api/answer", {q: q, a: nv}).catch(e => {
+    if (String(e.message).indexOf("expired") >= 0) submit(true);
+    else toast("Javob saqlanmadi, qayta bosing");
+  });
+}
+function renderReviewQuiz(onlyWrong) {
+  const box = $("rv-ans"); box.innerHTML = ""; box.className = "qwrap";
+  let shown = 0;
+  (RES.items || []).forEach(x => {
+    const ok = x.given === x.right;
+    if (onlyWrong && ok) return;
+    const item = qItem(x.q);
+    shown++;
+    const card = document.createElement("div"); card.className = "qcard"; card.style.marginBottom = "14px";
+    const n = document.createElement("div"); n.className = "qnum"; n.textContent = x.q + "-savol  " + (ok ? "✅" : "❌");
+    const t = document.createElement("div"); t.className = "qtext"; t.textContent = item.t;
+    card.appendChild(n); card.appendChild(t);
+    Object.keys(item.o).forEach(l => {
+      card.appendChild(optEl("div", l, item.o[l], l === x.right ? "good" : (l === x.given ? "bad" : "")));
+    });
+    if (!x.given) {
+      const m = document.createElement("div"); m.style.color = "#8a8fb0"; m.textContent = "Javob berilmagan";
+      card.appendChild(m);
+    }
+    box.appendChild(card);
+  });
+  if (!shown) {
+    const d = document.createElement("div"); d.className = "center"; d.textContent = onlyWrong ? "🎉 Xato yo'q" : "Ma'lumot yo'q";
+    box.appendChild(d);
+  }
+}
+
 /* ---- Xatolar tahlili ---- */
 function openReview() {
+  if (isQuiz()) {
+    if (!Object.keys(QD).length) S.qdata.forEach(x => { QD[x.q] = x; });
+    $("rt-ans").textContent = "📋 Hammasi"; $("rt-doc").textContent = "⚠️ Faqat xatolar";
+    show("rev"); setRevTab("ans"); return;
+  }
   const box = $("rv-ans"); box.innerHTML = "";
   const items = RES.items || RES.wrong;
   items.forEach(x => {
@@ -780,6 +977,11 @@ function openReview() {
   show("rev"); setRevTab("ans");
 }
 function setRevTab(t) {
+  if (isQuiz()) {
+    $("rv-doc").classList.add("hidden"); $("rv-ans").classList.remove("hidden");
+    $("rt-ans").classList.toggle("on", t === "ans"); $("rt-doc").classList.toggle("on", t === "doc");
+    renderReviewQuiz(t === "doc"); window.scrollTo(0, 0); return;
+  }
   $("rv-ans").classList.toggle("hidden", t !== "ans");
   $("rv-doc").classList.toggle("hidden", t !== "doc");
   $("rt-ans").classList.toggle("on", t === "ans");
@@ -829,8 +1031,7 @@ tg.onEvent("activated", comeBack);
   $("title").textContent = S.title;
   setPen(S.penalties);
   endAt = Date.now() + S.left * 1000;
-  buildSheet();
-  show("test");
+  if (isQuiz()) { buildQuiz(); show("quiz"); } else { buildSheet(); show("test"); }
   tick(); setInterval(tick, 1000);
   setInterval(async () => {
     if (finished || away) return;
@@ -842,7 +1043,7 @@ tg.onEvent("activated", comeBack);
       if (endAt - prev > 20000) toast("⏱ Test vaqti uzaytirildi");
     } catch (e) {}
   }, 15000);
-  loadDoc();
+  if (!isQuiz()) loadDoc();
 })();
 </script>
 </body></html>
@@ -898,7 +1099,9 @@ async def create_title(m: Message, state: FSMContext):
     await state.set_state(Create.file)
     await m.answer(
         "Test faylini yuboring (<b>PDF</b> yoki <b>.docx</b>)\n"
-        "yoki testni <b>oddiy matn</b> qilib yozib yuboring (uzun bo'lsa, bir necha xabarga bo'lib yuborishingiz mumkin)."
+        "yoki testni <b>matn</b> qilib yozib yuboring (uzun bo'lsa, bir necha xabarga bo'lib).\n\n"
+        "Matnni shu ko'rinishda yozsangiz, har bir savol variantlari bilan alohida sahifada chiqadi:\n"
+        "<code>1. Savol matni\nA) variant\nB) variant\nC) variant\nD) variant</code>"
     )
 
 
@@ -952,7 +1155,20 @@ async def text_done(c: CallbackQuery, state: FSMContext):
     parts = data.get("parts", [])
     if not parts:
         return await c.answer("Avval matn yuboring", show_alert=True)
-    await state.update_data(kind="text", body="\n".join(parts), file_id="")
+    body = "\n".join(parts)
+    qs = parse_quiz(body)
+    if qs:
+        await state.update_data(
+            kind="quiz", body=body, file_id="", questions=json.dumps(qs, ensure_ascii=False)
+        )
+        await c.message.answer(
+            f"✅ {len(qs)} ta savol variantlari bilan aniqlandi. Har biri alohida sahifada ko'rsatiladi."
+        )
+    else:
+        await state.update_data(kind="text", body=body, file_id="", questions=None)
+        await c.message.answer(
+            "ℹ️ Savol va variantlar (1. ... A) ...) formatida aniqlanmadi, matn oddiy ko'rinishda ko'rsatiladi."
+        )
     await state.set_state(Create.key)
     await c.message.answer(
         "Javoblar kalitini yuboring.\n\n"
@@ -972,6 +1188,18 @@ async def create_key(m: Message, state: FSMContext):
     key = parse_answers(m.text)
     if not key:
         return await m.answer("❌ Javoblar topilmadi. Qayta yuboring (masalan: abcdabcd).")
+    data = await state.get_data()
+    if data.get("questions"):
+        qs = json.loads(data["questions"])
+        if set(key.keys()) != {q["q"] for q in qs}:
+            return await m.answer(
+                f"⚠️ Matnda {len(qs)} ta savol bor, kalitda esa {len(key)} ta javob. Kalitni qayta yuboring."
+            )
+        for q in qs:
+            if key[q["q"]] not in q["o"]:
+                return await m.answer(
+                    f"⚠️ {q['q']}-savolda «{key[q['q']].upper()}» varianti yo'q. Kalitni qayta yuboring."
+                )
     await state.update_data(key=encode_key(key))
     await state.set_state(Create.minutes)
     await m.answer(f"✅ {len(key)} ta savol qabul qilindi.\n\n⏱ Test necha daqiqa davom etadi? (raqam)")
@@ -984,10 +1212,10 @@ async def create_minutes(m: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
     code = new_code()
     db.execute(
-        "INSERT INTO tests(code,owner_id,title,file_id,kind,answer_key,minutes,created,body) "
-        "VALUES(?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO tests(code,owner_id,title,file_id,kind,answer_key,minutes,created,body,questions) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
         (code, m.from_user.id, data["title"], data["file_id"], data["kind"],
-         data["key"], int(m.text), time.time(), data.get("body")),
+         data["key"], int(m.text), time.time(), data.get("body"), data.get("questions")),
     )
     db.commit()
     await state.clear()
