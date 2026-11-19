@@ -27,6 +27,7 @@ import re
 import sqlite3
 import string
 import time
+import unicodedata
 import zipfile
 from collections import Counter
 from urllib.parse import parse_qsl
@@ -177,11 +178,24 @@ def parse_answers(text: str) -> dict:
     return {i + 1: l for i, l in enumerate(re.findall(r"[a-z]", text))}
 
 
-# Raqam belgisi (savol tartibi) yoki harf belgisi (variant): "7." / "A." / "B)" / "C,"
+# Raqam belgisi (savol tartibi) yoki harf belgisi (variant): "7." / "№7." / "7-savol" / "A." / "B)" / "C,"
 TOKEN_RE = re.compile(
-    r"(?<!\d)(\d{1,3})\s*[.)](?!\d)"
+    r"(?<!\d)(?:№\s*|#\s*)?(\d{1,3})\s*(?:[.)]|-\s*[Ss]avol\s*[.:)]?)(?!\d)"
     r"|(?<![A-Za-z0-9'ʻʼ’`])([A-Ja-j])\s*[.),]"
 )
+_PUNCT = str.maketrans({"）": ")", "．": ".", "。": ".", "：": ":", "，": ",", "․": ".", "﹒": ".", "‧": "."})
+_LOOK = str.maketrans("АВСЕаес", "ABCEaec")
+
+
+def normalize_text(text: str) -> str:
+    """Ko'rinmas belgilar, kirill-lotin o'xshash harflar va keng qavslarni tozalaydi."""
+    t = text.replace("\r", "")
+    t = t.replace("\u00a0", " ").replace("\u202f", " ").replace("\u2009", " ")
+    t = re.sub(r"[\u200b-\u200f\u2060\ufeff\u00ad]", "", t)
+    t = t.translate(_PUNCT)
+    # variant belgisi o'rnidagi kirill А, В, С, Е ("А)" "В." ...) lotinchaga o'giriladi
+    t = re.sub(r"(?<![\w'ʻʼ’])([АВСЕаес])(?=\s*[.),])", lambda m: m.group(1).translate(_LOOK), t)
+    return t
 
 
 def _clean(s: str, keep_items: bool = False) -> str:
@@ -196,16 +210,14 @@ def _clean(s: str, keep_items: bool = False) -> str:
     return out
 
 
-def parse_quiz(text: str):
+def _scan(t: str, first=None, gap: int = 0):
     """
-    Savollarni matndan ajratadi. Qatorlarga bo'lingan ham, hammasi bir qatorda
-    ketma-ket yozilgan ("7. savol? A.bir B.ikki C.uch D.to'rt 8. savol? ...") ham ishlaydi.
-    Qoida: yangi savol raqami ketma-ket bo'lishi va oldingi savolda kamida 2 ta variant
-    bo'lishi kerak; variant harflari A, B, C... tartibida kelishi kerak.
+    Matnni savollarga bo'ladi. first — birinchi savol raqami (standart 1).
+    gap=0: raqamlar qat'iy ketma-ket; gap>0: orada raqam tushib qolgan bo'lsa ham qabul qilinadi.
+    Yangi savol faqat oldingi savolda kamida 2 ta variant bo'lgandan keyin boshlanadi.
     """
-    t = text.replace("\r", "")
-    qs, cur = [], None
-    kind, start = None, 0  # hozirgi bo'lak: "q" yoki variant harfi
+    qs, cur, last = [], None, None
+    kind, start = None, 0
 
     def close(end):
         chunk = t[start:end]
@@ -217,11 +229,17 @@ def parse_quiz(text: str):
     for m in TOKEN_RE.finditer(t):
         num, let = m.group(1), m.group(2)
         if num is not None:
-            if int(num) == len(qs) + 1 and (cur is None or cur["n"] >= 2):
+            n = int(num)
+            if cur is None:
+                ok = n == (first if first is not None else 1)
+            else:
+                ok = cur["n"] >= 2 and ((n == last + 1) if gap == 0 else (last < n <= last + 1 + gap))
+            if ok:
                 if cur is not None:
                     close(m.start())
-                cur = {"q": len(qs) + 1, "t": "", "o": {}, "n": 0}
+                cur = {"q": len(qs) + 1, "raw": n, "t": "", "o": {}, "n": 0}
                 qs.append(cur)
+                last = n
                 kind, start = "q", m.end()
             continue
         if cur is None:
@@ -233,11 +251,75 @@ def parse_quiz(text: str):
             kind, start = expect, m.end()
     if cur is not None:
         close(len(t))
-    if not qs or any(len(q["o"]) < 2 or not q["t"] for q in qs):
-        return None
-    for q in qs:
-        q.pop("n", None)
     return qs
+
+
+def _valid(qs) -> bool:
+    return bool(qs) and all(len(q["o"]) >= 2 and q["t"] for q in qs)
+
+
+def parse_quiz(text: str):
+    """
+    Savollarni matndan ajratadi. Qatorlarga bo'lingan ham, hammasi bir qatorda
+    ketma-ket yozilgan ham ishlaydi. Raqamlash 1 dan boshlanmasa yoki orada raqam
+    tushib qolgan bo'lsa ham, savollar 1 dan qayta raqamlanadi.
+    """
+    t = normalize_text(text)
+    starts = [1]
+    for m in TOKEN_RE.finditer(t):
+        if m.group(1) is not None and int(m.group(1)) not in starts:
+            starts.append(int(m.group(1)))
+            if len(starts) >= 6:
+                break
+    best = None
+    for first in starts:
+        for gap in (0, 3):
+            qs = _scan(t, first, gap)
+            if _valid(qs) and (best is None or len(qs) > len(best)):
+                best = qs
+    if not best:
+        return None
+    for q in best:
+        q.pop("n", None)
+    return best
+
+
+def diagnose_quiz(text: str) -> str:
+    """Savollar ajratilmaganda sababini tushuntiradi."""
+    t = normalize_text(text)
+    nums, lets = [], Counter()
+    for m in TOKEN_RE.finditer(t):
+        if m.group(1) is not None:
+            nums.append(int(m.group(1)))
+        else:
+            lets[m.group(2).upper()] += 1
+    out = [f"🔎 <b>Tahlil</b> (matn {len(text)} belgi):"]
+    out.append(
+        "• Savol raqamlari (<code>1.</code> yoki <code>1)</code>): "
+        + (f"{len(nums)} ta, birinchilari: {', '.join(map(str, nums[:10]))}" if nums else "topilmadi ❌")
+    )
+    out.append(
+        "• Variant belgilari (<code>A)</code> yoki <code>A.</code>): "
+        + (", ".join(f"{k}×{v}" for k, v in sorted(lets.items())) if lets else "topilmadi ❌")
+    )
+    odd = sorted({f"U+{ord(c):04X}" for c in text if unicodedata.category(c) in ("Cf", "Zs") and c != " "})
+    if odd:
+        out.append("• Ko'rinmas belgilar bor: " + ", ".join(odd[:6]) + " (bot ularni tozalaydi)")
+    if nums and lets:
+        qs = _scan(t, 1 if 1 in nums else nums[0], 0)
+        bad = next((q for q in qs if len(q["o"]) < 2 or not q["t"]), None)
+        if not qs:
+            out.append("• Birinchi savol belgisi topilmadi.")
+        elif bad:
+            why = "savol matni bo'sh" if not bad["t"] else f"faqat {len(bad['o'])} ta variant topildi (kamida 2 kerak)"
+            out.append(f"• <b>{bad['raw']}-savolda</b> {why}: «{html.escape((bad['t'] or '')[:70])}»")
+    head = html.escape(t.strip()[:120].replace("\n", " ⏎ "))
+    out.append(f"• Matn boshi: «{head}»")
+    out.append(
+        "\nTo'g'ri ko'rinish: <code>1. Savol matni</code> va keyin <code>A) variant</code>, "
+        "<code>B) variant</code>... (lotin harflari, A dan boshlab ketma-ket)."
+    )
+    return "\n".join(out)
 
 
 def qdata_for(test):
@@ -270,6 +352,9 @@ def quiz_note(qs) -> str:
         f"\n⚠️ Variantlar soni {common} tadan farq qiladigan savollar: {', '.join(odd[:20])}. Tekshirib ko'ring."
         if odd else ""
     )
+    raws = [q.get("raw", q["q"]) for q in qs]
+    if any(r != q["q"] for r, q in zip(raws, qs)):
+        note += f"\nℹ️ Savollar 1 dan qayta raqamlandi (asl raqamlar: {min(raws)}–{max(raws)})."
     return f"✅ {len(qs)} ta savol, har birida {common} tadan variant aniqlandi.{note}"
 
 
@@ -1414,9 +1499,10 @@ async def create_file_step(m: Message, state: FSMContext, bot: Bot):
             return await m.answer(
                 "📄 Word fayldan savollar o'qildi.\n" + quiz_note(qs) + "\nHar biri alohida sahifada ko'rsatiladi.\n\n" + KEY_PROMPT
             )
+        extra = ("\n\n" + diagnose_quiz(text)) if text else ""
         await m.answer(
             "ℹ️ Word fayldan savollarni ajratib bo'lmadi (raqam va harflar avtomatik ro'yxat bo'lishi mumkin). "
-            "Fayl o'z holicha ko'rsatiladi."
+            "Fayl o'z holicha ko'rsatiladi." + extra
         )
     await state.update_data(file_id=doc.file_id, kind=kind)
     await state.set_state(Create.key)
@@ -1468,7 +1554,7 @@ async def text_done(c: CallbackQuery, state: FSMContext):
     else:
         await state.update_data(kind="text", body=body, file_id="", questions=None)
         await c.message.answer(
-            "ℹ️ Savol va variantlar (1. ... A) ...) formatida aniqlanmadi, matn oddiy ko'rinishda ko'rsatiladi."
+            "ℹ️ Savol va variantlar aniqlanmadi, matn oddiy ko'rinishda ko'rsatiladi.\n\n" + diagnose_quiz(body)
         )
     await state.set_state(Create.key)
     await c.message.answer(KEY_PROMPT)
