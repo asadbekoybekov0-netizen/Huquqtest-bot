@@ -5,11 +5,16 @@ Muhit o'zgaruvchilari (Railway -> Variables):
     BOT_TOKEN   - BotFather tokeni
     WEBAPP_URL  - Railway bergan https havola (oxirida / siz)
     DB_PATH     - (ixtiyoriy) baza fayli, masalan /data/tests2.db (Volume ulansa)
+    CACHE_DIR   - (ixtiyoriy) fayllar keshi, masalan /data/filecache (Volume ulansa)
+    TZ_OFFSET   - (ixtiyoriy) mahalliy vaqt soat farqi, standart 5 (O'zbekiston)
     PORT        - Railway o'zi beradi
 
 Ishga tushirish:  python bot2.py
 """
 import asyncio
+import calendar
+import csv
+import datetime
 import hashlib
 import hmac
 import html
@@ -22,17 +27,21 @@ import re
 import sqlite3
 import string
 import time
+import zipfile
+from collections import Counter
 from urllib.parse import parse_qsl
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -47,6 +56,7 @@ WEBAPP_URL = os.getenv("WEBAPP_URL", "").rstrip("/")
 PORT = int(os.getenv("PORT", "8080"))
 DB_PATH = os.getenv("DB_PATH", "tests2.db")
 CACHE_DIR = os.getenv("CACHE_DIR", "filecache")
+TZ_OFFSET = float(os.getenv("TZ_OFFSET", "5"))  # mahalliy vaqt (soat), O'zbekiston = 5
 
 PENALTY = 1  # har bir chiqib ketish uchun ayriladigan ball
 GRACE = 1.5  # shuncha soniyadan qisqa uzilish jarima emas (bildirishnoma va h.k.)
@@ -59,13 +69,18 @@ db.executescript(
     """
 CREATE TABLE IF NOT EXISTS tests(
     code TEXT PRIMARY KEY, owner_id INTEGER, title TEXT, file_id TEXT,
-    kind TEXT, answer_key TEXT, minutes INTEGER, created REAL, body TEXT, questions TEXT);
+    kind TEXT, answer_key TEXT, minutes INTEGER, created REAL, body TEXT, questions TEXT,
+    shuffle INTEGER DEFAULT 0, closed INTEGER DEFAULT 0, opens_at REAL, closes_at REAL);
 CREATE TABLE IF NOT EXISTS attempts(
     code TEXT, user_id INTEGER, name TEXT, started REAL,
     finished INTEGER DEFAULT 0, correct INTEGER DEFAULT 0, total INTEGER DEFAULT 0,
     penalties INTEGER DEFAULT 0, score INTEGER DEFAULT 0,
-    answers TEXT DEFAULT '{}', left_at REAL, result TEXT,
+    answers TEXT DEFAULT '{}', left_at REAL, result TEXT, last_seen REAL, finished_at REAL,
     PRIMARY KEY(code, user_id));
+CREATE TABLE IF NOT EXISTS attempts_old(
+    code TEXT, user_id INTEGER, name TEXT, started REAL, finished INTEGER, correct INTEGER,
+    total INTEGER, penalties INTEGER, score INTEGER, answers TEXT, left_at REAL, result TEXT,
+    last_seen REAL, finished_at REAL, archived REAL);
 """
 )
 
@@ -78,6 +93,36 @@ for _col in ("body", "questions"):  # eski bazalar uchun yangi ustunlar
         pass
 
 
+try:  # eski bazalar uchun: oxirgi faollik vaqti
+    db.execute("ALTER TABLE attempts ADD COLUMN last_seen REAL")
+    db.commit()
+except sqlite3.OperationalError:
+    pass
+
+
+for _tbl, _col in (
+    ("tests", "shuffle INTEGER DEFAULT 0"),
+    ("tests", "closed INTEGER DEFAULT 0"),
+    ("tests", "opens_at REAL"),
+    ("tests", "closes_at REAL"),
+    ("attempts", "finished_at REAL"),
+):  # eski bazalar uchun yangi ustunlar
+    try:
+        db.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col}")
+        db.commit()
+    except sqlite3.OperationalError:
+        pass
+
+
+def touch(code, uid):
+    """Yechuvchi ilovada faol ekanini belgilaydi."""
+    db.execute(
+        "UPDATE attempts SET last_seen=? WHERE code=? AND user_id=? AND finished=0",
+        (time.time(), code, uid),
+    )
+    db.commit()
+
+
 def get_test(code):
     return db.execute("SELECT * FROM tests WHERE code=?", (code,)).fetchone()
 
@@ -86,6 +131,40 @@ def get_attempt(code, uid):
     return db.execute(
         "SELECT * FROM attempts WHERE code=? AND user_id=?", (code, uid)
     ).fetchone()
+
+
+def fmt_dt(ts: float) -> str:
+    return time.strftime("%d.%m %H:%M", time.gmtime(ts + TZ_OFFSET * 3600))
+
+
+def has_old(code, uid) -> bool:
+    return db.execute(
+        "SELECT 1 FROM attempts_old WHERE code=? AND user_id=? LIMIT 1", (code, uid)
+    ).fetchone() is not None
+
+
+def start_block(test, uid=None):
+    """Yangi yechuvchiga test yopiq/ochilmagan bo'lsa sabab matnini qaytaradi."""
+    if uid is not None and has_old(test["code"], uid):
+        return None  # qayta yechishga ruxsat berilgan
+    now = time.time()
+    if test["closed"]:
+        return "🔒 Bu test yopilgan."
+    if test["opens_at"] and now < test["opens_at"]:
+        return f"⏳ Test hali ochilmagan. Ochilish vaqti: {fmt_dt(test['opens_at'])}"
+    if test["closes_at"] and now > test["closes_at"]:
+        return "🔒 Bu testning qabul vaqti tugagan."
+    return None
+
+
+def rank_of(code, uid):
+    rows = db.execute(
+        "SELECT user_id FROM attempts WHERE code=? AND finished=1 "
+        "ORDER BY score DESC, COALESCE(finished_at, 1e18) ASC",
+        (code,),
+    ).fetchall()
+    ids = [r["user_id"] for r in rows]
+    return (ids.index(uid) + 1 if uid in ids else None), len(ids)
 
 
 # ----------------------------- YORDAMCHI -----------------------------
@@ -98,39 +177,66 @@ def parse_answers(text: str) -> dict:
     return {i + 1: l for i, l in enumerate(re.findall(r"[a-z]", text))}
 
 
-Q_RE = re.compile(r"^\s*(\d{1,3})\s*[.)]\s*(.*\S.*)$")
-O_RE = re.compile(r"^\s*\(?([A-Za-z])\)?\s*[).:]\s*(.*\S.*)$")
+# Raqam belgisi (savol tartibi) yoki harf belgisi (variant): "7." / "A." / "B)" / "C,"
+TOKEN_RE = re.compile(
+    r"(?<!\d)(\d{1,3})\s*[.)](?!\d)"
+    r"|(?<![A-Za-z0-9'ʻʼ’`])([A-Ja-j])\s*[.),]"
+)
+
+
+def _clean(s: str, keep_items: bool = False) -> str:
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in s.split("\n")]
+    lines = [ln for ln in lines if ln]
+    if not lines:
+        return ""
+    out = lines[0]
+    for ln in lines[1:]:
+        sep = "\n" if keep_items and re.match(r"\d{1,3}\s*[.)]", ln) else " "
+        out += sep + ln
+    return out
 
 
 def parse_quiz(text: str):
-    """'1. Savol / A) variant ...' matnini tuzilgan savollar ro'yxatiga aylantiradi."""
-    qs, cur, last = [], None, None
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        mq = Q_RE.match(line)
-        # yangi savol: raqami ketma-ket va oldingi savolda kamida 2 ta variant bor
-        if mq and int(mq.group(1)) == len(qs) + 1 and (cur is None or len(cur["o"]) >= 2):
-            cur = {"q": len(qs) + 1, "t": mq.group(2).strip(), "o": {}}
-            qs.append(cur)
-            last = "q"
+    """
+    Savollarni matndan ajratadi. Qatorlarga bo'lingan ham, hammasi bir qatorda
+    ketma-ket yozilgan ("7. savol? A.bir B.ikki C.uch D.to'rt 8. savol? ...") ham ishlaydi.
+    Qoida: yangi savol raqami ketma-ket bo'lishi va oldingi savolda kamida 2 ta variant
+    bo'lishi kerak; variant harflari A, B, C... tartibida kelishi kerak.
+    """
+    t = text.replace("\r", "")
+    qs, cur = [], None
+    kind, start = None, 0  # hozirgi bo'lak: "q" yoki variant harfi
+
+    def close(end):
+        chunk = t[start:end]
+        if kind == "q":
+            cur["t"] = _clean(chunk, keep_items=True)
+        elif kind:
+            cur["o"][kind] = _clean(chunk)
+
+    for m in TOKEN_RE.finditer(t):
+        num, let = m.group(1), m.group(2)
+        if num is not None:
+            if int(num) == len(qs) + 1 and (cur is None or cur["n"] >= 2):
+                if cur is not None:
+                    close(m.start())
+                cur = {"q": len(qs) + 1, "t": "", "o": {}, "n": 0}
+                qs.append(cur)
+                kind, start = "q", m.end()
             continue
         if cur is None:
             continue
-        mo = O_RE.match(line)
-        if mo:
-            expect = chr(ord("a") + len(cur["o"]))
-            if mo.group(1).lower() == expect:
-                cur["o"][expect] = mo.group(2).strip()
-                last = expect
-                continue
-        if last == "q":
-            cur["t"] += "\n" + line
-        elif last:
-            cur["o"][last] += " " + line
-    if not qs or any(len(q["o"]) < 2 for q in qs):
+        expect = chr(ord("a") + cur["n"])
+        if let.lower() == expect:
+            close(m.start())
+            cur["n"] += 1
+            kind, start = expect, m.end()
+    if cur is not None:
+        close(len(t))
+    if not qs or any(len(q["o"]) < 2 or not q["t"] for q in qs):
         return None
+    for q in qs:
+        q.pop("n", None)
     return qs
 
 
@@ -138,6 +244,33 @@ def qdata_for(test):
     if test["kind"] != "quiz" or not test["questions"]:
         return None
     return json.loads(test["questions"])
+
+
+def docx_to_text(data: bytes):
+    """Word (.docx) ichidagi matnni oladi (qo'lda yozilgan raqam/harflar uchun)."""
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            xml = z.read("word/document.xml").decode("utf-8", "ignore")
+    except Exception:
+        return None
+    out = []
+    for p in re.findall(r"<w:p[ >].*?</w:p>", xml, re.S):
+        p = re.sub(r"<w:tab\s*/>", " ", p)
+        p = re.sub(r"<w:br\s*/>", "\n", p)
+        txt = "".join(re.findall(r"<w:t(?:\s[^>]*)?>(.*?)</w:t>", p, re.S))
+        out.append(html.unescape(txt))
+    return "\n".join(out)
+
+
+def quiz_note(qs) -> str:
+    sizes = [len(q["o"]) for q in qs]
+    common = max(set(sizes), key=sizes.count)
+    odd = [str(q["q"]) for q in qs if len(q["o"]) != common]
+    note = (
+        f"\n⚠️ Variantlar soni {common} tadan farq qiladigan savollar: {', '.join(odd[:20])}. Tekshirib ko'ring."
+        if odd else ""
+    )
+    return f"✅ {len(qs)} ta savol, har birida {common} tadan variant aniqlandi.{note}"
 
 
 def encode_key(d: dict) -> str:
@@ -159,7 +292,7 @@ def time_left(test, att) -> float:
     return att["started"] + test["minutes"] * 60 - time.time()
 
 
-def finalize(code: str, uid: int):
+def finalize(code: str, uid: int, kicked: bool = False):
     """Natijani hisoblaydi. (natija_dict, yangi_yakunlandimi) qaytaradi."""
     test, att = get_test(code), get_attempt(code, uid)
     if att["finished"] and att["result"]:
@@ -186,6 +319,7 @@ def finalize(code: str, uid: int):
         "penalties": pen * PENALTY,
         "score": score,
         "wrong": wrong,
+        "kicked": kicked,
         "items": [
             {"q": n, "given": given.get(n, ""), "right": l}
             for n, l in sorted(key.items())
@@ -193,20 +327,32 @@ def finalize(code: str, uid: int):
     }
     db.execute(
         "UPDATE attempts SET finished=1, correct=?, total=?, penalties=?, score=?, "
-        "left_at=NULL, result=? WHERE code=? AND user_id=?",
-        (correct, total, pen, score, json.dumps(res), code, uid),
+        "left_at=NULL, result=?, finished_at=? WHERE code=? AND user_id=?",
+        (correct, total, pen, score, json.dumps(res), time.time(), code, uid),
     )
     db.commit()
     return res, True
 
 
-def result_text(r: dict) -> str:
+def bar(pct: int, n: int = 10) -> str:
+    k = max(0, min(n, round(pct / 100 * n)))
+    return "▰" * k + "▱" * (n - k)
+
+
+def result_text(r: dict, rank=None) -> str:
+    total = r["total"]
+    pct = round(r["score"] / total * 100) if total else 0
     t = (
-        f"📊 <b>{html.escape(r['title'])}</b> natijasi\n\n"
-        f"✅ To'g'ri: {r['correct']}/{r['total']}\n"
+        f"📊 <b>{html.escape(r['title'])}</b>\n\n"
+        f"{bar(pct)}  <b>{pct}%</b>\n\n"
+        f"✅ To'g'ri javoblar: <b>{r['correct']}/{total}</b>\n"
         f"🚪 Chiqib ketish jarimasi: -{r['penalties']}\n"
         f"🏆 Yakuniy ball: <b>{r['score']}</b>\n"
     )
+    if rank and rank[0]:
+        t += f"📈 Hozirgi reyting: <b>{rank[0]}-o'rin</b> ({rank[1]} kishidan)\n"
+    if r.get("kicked"):
+        t += "🚫 Test egasi tomonidan tugatildi\n"
     w = r["wrong"]
     if w:
         lines = [
@@ -217,7 +363,7 @@ def result_text(r: dict) -> str:
         if len(w) > 60:
             t += f"\n... va yana {len(w) - 60} ta"
     else:
-        t += "\n🎉 Xatosiz!"
+        t += "\n🎉 Xatosiz! Barakalla!"
     return t
 
 
@@ -244,14 +390,17 @@ def review_kb(code: str):
     )
 
 
-async def conclude(bot: Bot, code: str, uid: int, prefix: str = "") -> dict:
-    res, new = finalize(code, uid)
+async def conclude(bot: Bot, code: str, uid: int, prefix: str = "", kicked: bool = False) -> dict:
+    res, new = finalize(code, uid, kicked)
     if new:
         try:
-            await bot.send_message(uid, prefix + result_text(res), reply_markup=review_kb(code))
+            await bot.send_message(
+                uid, prefix + result_text(res, rank_of(code, uid)), reply_markup=review_kb(code)
+            )
         except Exception:
             pass
-        await notify_owner(bot, code, uid)
+        if not kicked:
+            await notify_owner(bot, code, uid)
     return res
 
 
@@ -338,10 +487,13 @@ async def api_start(request):
     att = get_attempt(code, uid)
     if att and att["finished"]:
         res, _ = finalize(code, uid)
-        return web.json_response({"finished": True, "result": res, "kind": test["kind"], "qdata": qdata_for(test)})
+        return web.json_response({"finished": True, "result": res, "kind": test["kind"], "qdata": qdata_for(test), "shuffle": test["shuffle"] or 0, "seed": f"{code}:{uid}"})
 
     new = att is None
     if new:
+        block = start_block(test, uid)
+        if block:
+            raise web.HTTPConflict(text=block)
         db.execute(
             "INSERT INTO attempts(code,user_id,name,started) VALUES(?,?,?,?)",
             (code, uid, name, time.time()),
@@ -355,11 +507,12 @@ async def api_start(request):
         )
         db.commit()
     att = get_attempt(code, uid)
+    touch(code, uid)
 
     left = time_left(test, att)
     if left <= 0:
         res = await conclude(bot, code, uid, "⌛ Vaqt tugadi.\n\n")
-        return web.json_response({"finished": True, "result": res, "kind": test["kind"], "qdata": qdata_for(test)})
+        return web.json_response({"finished": True, "result": res, "kind": test["kind"], "qdata": qdata_for(test), "shuffle": test["shuffle"] or 0, "seed": f"{code}:{uid}"})
     if new:
         asyncio.create_task(timer_task(bot, code, uid, left))
 
@@ -372,6 +525,8 @@ async def api_start(request):
             "title": test["title"],
             "kind": test["kind"],
             "qdata": qdata_for(test),
+            "shuffle": test["shuffle"] or 0,
+            "seed": f"{code}:{uid}",
             "questions": sorted(key.keys()),
             "options": options,
             "left": left,
@@ -412,6 +567,7 @@ async def api_answer(request):
     d = await read_body(request)
     uid, _ = auth(d)
     code = str(d.get("code", "")).upper()
+    touch(code, uid)
     test, att = get_test(code), get_attempt(code, uid)
     if not test or not att or att["finished"] or time_left(test, att) <= 0:
         raise web.HTTPConflict(text="expired")
@@ -440,6 +596,7 @@ async def api_leave(request):
     d = await read_body(request)
     uid, _ = auth(d)
     code = str(d.get("code", "")).upper()
+    touch(code, uid)
     att = get_attempt(code, uid)
     if att and not att["finished"] and not att["left_at"]:
         db.execute(
@@ -454,6 +611,7 @@ async def api_back(request):
     d = await read_body(request)
     uid, _ = auth(d)
     code = str(d.get("code", "")).upper()
+    touch(code, uid)
     test, att = get_test(code), get_attempt(code, uid)
     if not test or not att:
         raise web.HTTPNotFound(text="Topilmadi")
@@ -496,6 +654,7 @@ async def api_sync(request):
     d = await read_body(request)
     uid, _ = auth(d)
     code = str(d.get("code", "")).upper()
+    touch(code, uid)
     test, att = get_test(code), get_attempt(code, uid)
     if not test or not att:
         raise web.HTTPNotFound(text="Topilmadi")
@@ -544,13 +703,18 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=5, viewport-fit=cover">
 <title>Test</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700&display=swap" rel="stylesheet">
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
 <style>
 :root{--bg:var(--tg-theme-bg-color,#fff);--tx:var(--tg-theme-text-color,#111);--hint:var(--tg-theme-hint-color,#888);--btn:var(--tg-theme-button-color,#2481cc);--btx:var(--tg-theme-button-text-color,#fff);--sec:var(--tg-theme-secondary-bg-color,#f1f1f1)}
+:root{--qbg:#f5f6fb;--qtx:#151a4a;--qcard:#fff;--qline:#e3e5f0;--qsoft:#eceef8;--qsel:#eef0ff;--pri:#5b67e8;--curbg:#161a4d;--qmuted:#8a8fb0;--goodbg:#e8f7ea;--badbg:#fdeaea;--qshadow:rgba(30,36,100,.08)}
+body.dark{--qbg:#0e1022;--qtx:#e9ebff;--qcard:#191d3b;--qline:#2b3060;--qsoft:#252a52;--qsel:#232b6b;--curbg:#5b67e8;--qmuted:#8f95c4;--goodbg:#12311c;--badbg:#3a1a20;--qshadow:rgba(0,0,0,.35)}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.4 -apple-system,system-ui,sans-serif}
+body{margin:0;background:var(--bg);color:var(--tx);font:16px/1.4 "Plus Jakarta Sans",-apple-system,system-ui,sans-serif}
 .hidden{display:none!important}
 .center{padding:40px 20px;text-align:center}
 header{position:sticky;top:0;z-index:5;background:var(--bg);border-bottom:1px solid var(--sec);padding:8px 12px}
@@ -566,38 +730,58 @@ main{padding-bottom:90px}
 #doc,#doc2{background:#fff;color:#000;min-height:200px}
 #doc canvas,#doc2 canvas{display:block;margin:0 auto 6px}
 .q.bad{background:rgba(229,57,53,.10)}
-.qwrap{background:#f5f6fb;color:#151a4a;min-height:100vh;padding:14px 14px 40px}
-.qhead{background:#161a4d;color:#fff;border-radius:16px;padding:12px 14px;display:flex;justify-content:space-between;gap:10px;font-size:14px;box-shadow:0 6px 16px rgba(22,26,77,.25)}
+.qwrap{background:var(--qbg);color:var(--qtx);min-height:100vh;padding:14px 14px 40px;transition:background .3s}
+.qhead{background:linear-gradient(135deg,#161a4d,#2d33a0);color:#fff;border-radius:18px;padding:12px 14px;display:flex;justify-content:space-between;gap:10px;font-size:14px;box-shadow:0 8px 20px rgba(22,26,77,.3)}
 .qhead div{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .qrow{display:flex;justify-content:space-between;align-items:center;margin:14px 2px 6px;gap:10px}
 .qtitle{font-weight:700;font-size:18px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
-.qtimer{background:#fff;border:1px solid #e3e5f0;border-radius:999px;padding:8px 14px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
-.qtimer.low{color:#e53935;border-color:#e53935}
-.qwarn{font-size:13px;color:#8a8fb0;margin:0 2px 10px}
-.qbar{height:8px;background:#e8eaf5;border-radius:99px;overflow:hidden;margin-bottom:14px}
-.qbar i{display:block;height:100%;background:#5b67e8;border-radius:99px;width:0;transition:width .25s}
-.qcard{background:#fff;border-radius:22px;padding:20px 16px;box-shadow:0 8px 24px rgba(30,36,100,.08)}
-.qnum{color:#5b67e8;font-weight:600;font-size:14px;margin-bottom:8px}
-.qtext{font-weight:700;font-size:18px;line-height:1.45;white-space:pre-wrap;word-wrap:break-word;margin-bottom:16px}
-.opt{display:flex;align-items:center;gap:12px;width:100%;text-align:left;background:#fff;border:2px solid #e3e5f0;border-radius:18px;padding:12px 14px;margin-bottom:10px;font-size:16px;color:#151a4a;font-family:inherit}
-.opt.sel{border-color:#5b67e8;background:#eef0ff}
-.opt.good{border-color:#4db35a;background:#e8f7ea}
-.opt.bad{border-color:#e53935;background:#fdeaea}
-.ol{flex:none;width:34px;height:34px;border-radius:50%;background:#eceef8;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px}
-.opt.sel .ol{background:#5b67e8;color:#fff}
+.qtimer{background:var(--qcard);border:1px solid var(--qline);border-radius:999px;padding:8px 14px;font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.qtimer.low{color:#e53935;border-color:#e53935;animation:pulse 1s infinite}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.07)}}
+.qwarn{font-size:13px;color:var(--qmuted);margin:0 2px 10px}
+.qbar{height:8px;background:var(--qsoft);border-radius:99px;overflow:hidden;margin-bottom:14px}
+.qbar i{display:block;height:100%;background:linear-gradient(90deg,var(--pri),#8a94ff);border-radius:99px;width:0;transition:width .4s ease}
+.qcard{background:var(--qcard);border-radius:22px;padding:20px 16px;box-shadow:0 8px 24px var(--qshadow)}
+.qcard.slide{animation:qin .28s ease}
+@keyframes qin{from{opacity:0;transform:translateX(22px)}to{opacity:1;transform:none}}
+.qtop{display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px}
+.qnum{color:var(--pri);font-weight:600;font-size:14px}
+.qtools{display:flex;gap:6px}
+.tbtn{min-width:34px;height:32px;padding:0 8px;border-radius:10px;border:1px solid var(--qline);background:var(--qcard);color:var(--qtx);font-weight:700;font-size:13px}
+.tbtn.on{background:#fff4d6;border-color:#f5a623;color:#9a6200}
+.qtext{font-weight:700;font-size:var(--fs,18px);line-height:1.45;white-space:pre-wrap;word-wrap:break-word;margin-bottom:16px}
+.opt{display:flex;align-items:center;gap:12px;width:100%;text-align:left;background:var(--qcard);border:2px solid var(--qline);border-radius:18px;padding:12px 14px;margin-bottom:10px;font-size:16px;color:var(--qtx);font-family:inherit;transition:transform .12s,border-color .15s,background .15s}
+.opt:active{transform:scale(.985)}
+.opt.sel{border-color:var(--pri);background:var(--qsel)}
+.opt.good{border-color:#4db35a;background:var(--goodbg)}
+.opt.bad{border-color:#e53935;background:var(--badbg)}
+.ol{flex:none;width:34px;height:34px;border-radius:50%;background:var(--qsoft);display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px}
+.opt.sel .ol{background:var(--pri);color:#fff}
 .opt.good .ol{background:#4db35a;color:#fff}
 .opt.bad .ol{background:#e53935;color:#fff}
-.ot{flex:1;white-space:pre-wrap;word-wrap:break-word}
+.ot{flex:1;white-space:pre-wrap;word-wrap:break-word;font-size:calc(var(--fs,18px) - 2px)}
 .qnav{display:flex;justify-content:space-between;margin-top:14px}
-.nbtn{padding:12px 22px;border-radius:999px;border:1px solid #e3e5f0;background:#fff;color:#151a4a;font-size:16px;font-weight:600}
+.nbtn{padding:12px 22px;border-radius:999px;border:1px solid var(--qline);background:var(--qcard);color:var(--qtx);font-size:16px;font-weight:600}
 .nbtn:disabled{opacity:.4}
-.nbtn.pri{background:#5b67e8;color:#fff;border:0;box-shadow:0 8px 18px rgba(91,103,232,.35)}
+.nbtn.pri{background:var(--pri);color:#fff;border:0;box-shadow:0 8px 18px rgba(91,103,232,.35)}
 .qgrid{display:grid;grid-template-columns:repeat(8,1fr);gap:8px;margin:18px 0 12px}
-.gn{aspect-ratio:1;border-radius:12px;border:1px solid #e3e5f0;background:#fff;color:#151a4a;font-weight:600;font-size:14px;padding:0}
+.gn{aspect-ratio:1;border-radius:12px;border:1px solid var(--qline);background:var(--qcard);color:var(--qtx);font-weight:600;font-size:14px;padding:0}
 .gn.done{background:#5cc36a;border-color:#4db35a;color:#fff}
-.gn.cur{background:#161a4d;border-color:#161a4d;color:#fff}
-.qleg{font-size:13px;color:#6a6f94;display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center}
+.gn.cur{background:var(--curbg);border-color:var(--curbg);color:#fff}
+.gn.flag{box-shadow:inset 0 0 0 3px #f5a623}
+.qleg{font-size:13px;color:var(--qmuted);display:flex;flex-wrap:wrap;gap:6px 14px;align-items:center}
 .qleg i{display:inline-block;width:12px;height:12px;border-radius:4px;margin-right:4px;vertical-align:-1px}
+.lg-done{background:#5cc36a}
+.lg-cur{background:var(--curbg)}
+.lg-none{background:var(--qcard);border:1px solid var(--qline)}
+.lg-flag{background:var(--qcard);border:2px solid #f5a623}
+.allmsg{margin-top:16px;padding:10px 12px;border-radius:14px;background:var(--goodbg);text-align:center;font-weight:600}
+.big.pulse{animation:pulse 1.2s infinite}
+.donut{position:relative;width:140px;height:140px;margin:6px auto 12px}
+.donut svg{transform:rotate(-90deg)}
+.donut b{position:absolute;left:0;top:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;font-size:30px}
+.conf{position:fixed;top:-30px;font-size:22px;animation:fall 2.8s linear forwards;z-index:30;pointer-events:none}
+@keyframes fall{to{transform:translateY(115vh) rotate(540deg)}}
 .docx{padding:14px;overflow-x:auto}
 .docx img{max-width:100%}
 .txt{white-space:pre-wrap;font-size:17px;line-height:1.55;word-wrap:break-word}
@@ -638,20 +822,23 @@ footer{position:fixed;left:0;right:0;bottom:0;background:var(--bg);border-top:1p
   <div class="qrow"><div class="qtitle" id="q-title"></div><div class="qtimer" id="qtimer">--:--</div></div>
   <div class="qwarn" id="qpen"></div>
   <div class="qbar"><i id="q-bar"></i></div>
-  <div class="qcard">
-    <div class="qnum" id="q-num"></div>
+  <div class="qcard" id="q-card">
+    <div class="qtop"><div class="qnum" id="q-num"></div><div class="qtools"><button class="tbtn" id="t-small">A−</button><button class="tbtn" id="t-big">A+</button><button class="tbtn" id="t-flag">🚩</button></div></div>
     <div class="qtext" id="q-text"></div>
     <div id="q-opts"></div>
     <div class="qnav"><button class="nbtn" id="q-prev">Oldingi</button><button class="nbtn pri" id="q-next">Keyingi</button></div>
   </div>
   <div class="qgrid" id="q-grid"></div>
-  <div class="qleg"><b id="q-count"></b><span>javob berildi</span><span><i style="background:#5cc36a"></i>Javob berilgan</span><span><i style="background:#161a4d"></i>Hozirgi savol</span><span><i style="background:#fff;border:1px solid #e3e5f0"></i>Javobsiz</span></div>
+  <div class="qleg"><b id="q-count"></b><span>javob berildi</span><span><i class="lg-done"></i>Javob berilgan</span><span><i class="lg-cur"></i>Hozirgi savol</span><span><i class="lg-none"></i>Javobsiz</span><span><i class="lg-flag"></i>Belgilangan</span></div>
+  <div class="allmsg hidden" id="q-allmsg">🎉 Hammasiga javob berildi. Yakunlashga tayyormisiz?</div>
   <div style="margin-top:18px"><button class="big" id="q-finish">✅ Testni yakunlash</button></div>
 </div>
 
 <div id="s-res" class="hidden">
   <div class="card">
     <h2 id="r-title"></h2>
+    <div id="r-kick" class="hidden" style="color:#e53935;font-weight:600;margin-bottom:8px">🚫 Test egasi tomonidan tugatildi</div>
+    <div class="donut" id="r-donut"></div>
     <div class="big-n" id="r-main"></div>
     <div>✅ To'g'ri javoblar</div>
     <p>🚪 Chiqib ketish jarimasi: <b id="r-pen"></b></p>
@@ -684,12 +871,16 @@ footer{position:fixed;left:0;right:0;bottom:0;background:var(--bg);border-top:1p
 <script>
 const tg = window.Telegram.WebApp;
 tg.ready(); tg.expand();
+function applyTheme() { document.body.classList.toggle("dark", tg.colorScheme === "dark"); }
+applyTheme();
+try { tg.onEvent("themeChanged", applyTheme); } catch (e) {}
 try { if (tg.disableVerticalSwipes) tg.disableVerticalSwipes(); tg.enableClosingConfirmation(); } catch (e) {}
 const INIT = tg.initData || "";
 const CODE = (new URLSearchParams(location.search).get("code") || "").toUpperCase();
 const $ = id => document.getElementById(id);
 let S = null, finished = false, answers = {}, endAt = 0;
 let away = false, ignoreAway = false, leaveP = Promise.resolve();
+let warn60 = false, initialLeft = 0, SEQ = [], PERM = {}, flags = {}, flagKey = "", allShown = false, fs = 18;
 
 function post(path, extra, keepalive) {
   return fetch(path, {
@@ -710,6 +901,18 @@ function show(name) {
 function toast(t) {
   const el = $("toast"); el.textContent = t; el.classList.remove("hidden");
   setTimeout(() => el.classList.add("hidden"), 3500);
+}
+function haptic(kind) { try { tg.HapticFeedback.notificationOccurred(kind); } catch (e) {} }
+function lsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function lsSet(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+function confetti() {
+  const em = ["🎉", "✨", "🎊", "⭐"];
+  for (let i = 0; i < 36; i++) {
+    const sp = document.createElement("span"); sp.className = "conf"; sp.textContent = em[i % em.length];
+    sp.style.left = (Math.random() * 96) + "vw"; sp.style.animationDelay = (Math.random() * 0.9) + "s";
+    document.body.appendChild(sp);
+    setTimeout(() => { if (sp.remove) sp.remove(); }, 4200);
+  }
 }
 function fatal(msg) { $("s-load").textContent = "❌ " + msg; }
 function fmt(s) {
@@ -740,6 +943,8 @@ function tick() {
   $("timer").classList.toggle("low", left < 60);
   $("qtimer").textContent = "⏱ " + fmt(left);
   $("qtimer").classList.toggle("low", left < 60);
+  if (left <= 60 && left > 0 && !warn60 && initialLeft > 120) { warn60 = true; haptic("warning"); }
+  if (left > 70) warn60 = false;
   if (left <= 0) checkEnd();
 }
 
@@ -833,6 +1038,19 @@ function showResult(r) {
   RES = r;
   try { tg.disableClosingConfirmation(); } catch (e) {}
   $("r-title").textContent = r.title;
+  $("r-kick").classList.toggle("hidden", !r.kicked);
+  const pct = r.total ? Math.round(r.score / r.total * 100) : 0;
+  const col = pct >= 80 ? "#2fb344" : (pct >= 50 ? "#f5a623" : "#e53935");
+  const C = 2 * Math.PI * 54;
+  $("r-donut").innerHTML = '<svg width="140" height="140" viewBox="0 0 140 140">' +
+    '<circle cx="70" cy="70" r="54" fill="none" stroke="rgba(128,128,128,.25)" stroke-width="14"/>' +
+    '<circle cx="70" cy="70" r="54" fill="none" stroke="' + col + '" stroke-width="14" stroke-linecap="round" ' +
+    'stroke-dasharray="' + C.toFixed(1) + '" stroke-dashoffset="' + C.toFixed(1) + '"/></svg>' +
+    '<b style="color:' + col + '">' + pct + '%</b>';
+  setTimeout(() => {
+    const arc = $("r-donut").querySelectorAll("circle")[1];
+    if (arc) { arc.style.transition = "stroke-dashoffset 1s ease"; arc.style.strokeDashoffset = (C * (1 - pct / 100)).toFixed(1); }
+  }, 60);
   $("r-main").textContent = r.correct + "/" + r.total;
   $("r-pen").textContent = "-" + r.penalties;
   $("r-score").textContent = r.score;
@@ -844,6 +1062,7 @@ function showResult(r) {
     w.appendChild(d);
   });
   show("res");
+  if (pct >= 80 && !r.kicked) { confetti(); haptic("success"); }
 }
 
 async function submit(auto) {
@@ -880,47 +1099,90 @@ function optEl(tag, l, txt, cls) {
   d.appendChild(c); d.appendChild(t);
   return d;
 }
+function hashStr(str) {
+  let h = 1779033703 ^ str.length;
+  for (let i = 0; i < str.length; i++) { h = Math.imul(h ^ str.charCodeAt(i), 3432918353); h = (h << 13) | (h >>> 19); }
+  return h >>> 0;
+}
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function shuffleArr(arr, rnd) {
+  for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); const t = arr[i]; arr[i] = arr[j]; arr[j] = t; }
+  return arr;
+}
+function prepOrder() {
+  const mode = S.shuffle || 0, rnd = mulberry32(hashStr(String(S.seed || CODE)));
+  SEQ = S.questions.slice(); PERM = {};
+  if (mode >= 1) shuffleArr(SEQ, rnd);
+  S.questions.forEach(q => {
+    const letters = Object.keys(qItem(q).o);
+    PERM[q] = mode >= 2 ? shuffleArr(letters.slice(), rnd) : letters;
+  });
+}
+function applyFs() { document.documentElement.style.setProperty("--fs", fs + "px"); }
+function go(i) { if (i < 0 || i >= SEQ.length) return; cur = i; renderQuiz(true); window.scrollTo(0, 0); }
 function buildQuiz() {
   QD = {}; S.qdata.forEach(x => { QD[x.q] = x; });
+  prepOrder();
   const U = (tg.initDataUnsafe && tg.initDataUnsafe.user) || {};
   $("q-user").textContent = "👤 " + ((U.first_name || "") + " " + (U.last_name || "")).trim();
   $("q-id").textContent = U.id ? ("ID: " + U.id) : "";
   $("q-title").textContent = S.title;
-  const first = S.questions.findIndex(n => !answers[n]);
+  flagKey = "fl:" + CODE + ":" + (U.id || "");
+  try { flags = JSON.parse(lsGet(flagKey) || "{}") || {}; } catch (e) { flags = {}; }
+  fs = parseInt(lsGet("fs") || "18", 10) || 18; applyFs();
+  const first = SEQ.findIndex(n => !answers[n]);
   cur = first >= 0 ? first : 0;
-  $("q-prev").onclick = () => { if (cur > 0) { cur--; renderQuiz(); window.scrollTo(0, 0); } };
-  $("q-next").onclick = () => {
-    if (cur < S.questions.length - 1) { cur++; renderQuiz(); window.scrollTo(0, 0); } else submit(false);
-  };
+  $("q-prev").onclick = () => go(cur - 1);
+  $("q-next").onclick = () => { if (cur < SEQ.length - 1) go(cur + 1); else submit(false); };
   $("q-finish").onclick = () => submit(false);
-  renderQuiz();
+  $("t-small").onclick = () => { fs = Math.max(14, fs - 2); lsSet("fs", String(fs)); applyFs(); };
+  $("t-big").onclick = () => { fs = Math.min(26, fs + 2); lsSet("fs", String(fs)); applyFs(); };
+  $("t-flag").onclick = () => {
+    const q = SEQ[cur];
+    if (flags[q]) delete flags[q]; else flags[q] = 1;
+    lsSet(flagKey, JSON.stringify(flags)); renderQuiz();
+  };
+  renderQuiz(true);
 }
-function renderQuiz() {
-  const q = S.questions[cur], item = qItem(q);
-  $("q-num").textContent = (cur + 1) + "-savol / " + S.questions.length;
+function renderQuiz(anim) {
+  const q = SEQ[cur], item = qItem(q);
+  $("q-num").textContent = (cur + 1) + "-savol / " + SEQ.length;
   $("q-text").textContent = item.t;
+  if (anim) { const c = $("q-card"); c.classList.remove("slide"); void c.offsetWidth; c.classList.add("slide"); }
   const box = $("q-opts"); box.innerHTML = "";
-  Object.keys(item.o).forEach(l => {
-    const b = optEl("button", l, item.o[l], answers[q] === l ? "sel" : "");
+  PERM[q].forEach((l, i) => {
+    const b = optEl("button", String.fromCharCode(97 + i), item.o[l], answers[q] === l ? "sel" : "");
     b.onclick = () => choose(l);
     box.appendChild(b);
   });
+  $("t-flag").classList.toggle("on", !!flags[q]);
   $("q-prev").disabled = cur === 0;
-  $("q-next").textContent = cur === S.questions.length - 1 ? "Yakunlash" : "Keyingi";
+  $("q-next").textContent = cur === SEQ.length - 1 ? "Yakunlash" : "Keyingi";
   const g = $("q-grid"); g.innerHTML = "";
-  S.questions.forEach((n, i) => {
+  SEQ.forEach((n, i) => {
     const b = document.createElement("button");
-    b.className = "gn" + (answers[n] ? " done" : "") + (i === cur ? " cur" : "");
-    b.textContent = n;
-    b.onclick = () => { cur = i; renderQuiz(); window.scrollTo(0, 0); };
+    b.className = "gn" + (answers[n] ? " done" : "") + (i === cur ? " cur" : "") + (flags[n] ? " flag" : "");
+    b.textContent = i + 1;
+    b.onclick = () => go(i);
     g.appendChild(b);
   });
-  const done = Object.keys(answers).length;
-  $("q-count").textContent = done + " / " + S.questions.length;
-  $("q-bar").style.width = (done / S.questions.length * 100) + "%";
+  const done = Object.keys(answers).length, all = done === SEQ.length;
+  $("q-count").textContent = done + " / " + SEQ.length;
+  $("q-bar").style.width = (done / SEQ.length * 100) + "%";
+  $("q-allmsg").classList.toggle("hidden", !all);
+  $("q-finish").classList.toggle("pulse", all);
+  if (all && !allShown) { allShown = true; haptic("success"); }
+  if (!all) allShown = false;
 }
 function choose(l) {
-  const q = S.questions[cur];
+  const q = SEQ[cur];
   const nv = answers[q] === l ? "" : l;
   if (nv) answers[q] = nv; else delete answers[q];
   renderQuiz();
@@ -931,18 +1193,21 @@ function choose(l) {
 }
 function renderReviewQuiz(onlyWrong) {
   const box = $("rv-ans"); box.innerHTML = ""; box.className = "qwrap";
+  const byQ = {}; (RES.items || RES.wrong || []).forEach(x => { byQ[x.q] = x; });
   let shown = 0;
-  (RES.items || []).forEach(x => {
+  SEQ.forEach((q, i) => {
+    const x = byQ[q];
+    if (!x) return;
     const ok = x.given === x.right;
     if (onlyWrong && ok) return;
-    const item = qItem(x.q);
+    const item = qItem(q);
     shown++;
     const card = document.createElement("div"); card.className = "qcard"; card.style.marginBottom = "14px";
-    const n = document.createElement("div"); n.className = "qnum"; n.textContent = x.q + "-savol  " + (ok ? "✅" : "❌");
+    const n = document.createElement("div"); n.className = "qnum"; n.textContent = (i + 1) + "-savol  " + (ok ? "✅" : "❌");
     const t = document.createElement("div"); t.className = "qtext"; t.textContent = item.t;
     card.appendChild(n); card.appendChild(t);
-    Object.keys(item.o).forEach(l => {
-      card.appendChild(optEl("div", l, item.o[l], l === x.right ? "good" : (l === x.given ? "bad" : "")));
+    PERM[q].forEach((l, k) => {
+      card.appendChild(optEl("div", String.fromCharCode(97 + k), item.o[l], l === x.right ? "good" : (l === x.given ? "bad" : "")));
     });
     if (!x.given) {
       const m = document.createElement("div"); m.style.color = "#8a8fb0"; m.textContent = "Javob berilmagan";
@@ -959,7 +1224,7 @@ function renderReviewQuiz(onlyWrong) {
 /* ---- Xatolar tahlili ---- */
 function openReview() {
   if (isQuiz()) {
-    if (!Object.keys(QD).length) S.qdata.forEach(x => { QD[x.q] = x; });
+    if (!SEQ.length) { QD = {}; S.qdata.forEach(x => { QD[x.q] = x; }); prepOrder(); }
     $("rt-ans").textContent = "📋 Hammasi"; $("rt-doc").textContent = "⚠️ Faqat xatolar";
     show("rev"); setRevTab("ans"); return;
   }
@@ -1031,6 +1296,7 @@ tg.onEvent("activated", comeBack);
   $("title").textContent = S.title;
   setPen(S.penalties);
   endAt = Date.now() + S.left * 1000;
+  initialLeft = S.left;
   if (isQuiz()) { buildQuiz(); show("quiz"); } else { buildSheet(); show("test"); }
   tick(); setInterval(tick, 1000);
   setInterval(async () => {
@@ -1073,15 +1339,24 @@ menu_kb = ReplyKeyboardMarkup(
 )
 
 
+KEY_PROMPT = (
+    "🔑 <b>3/4-qadam</b>\nJavoblar kalitini yuboring.\n\n"
+    "Misol: <code>abcdabcdab</code>\n"
+    "yoki: <code>1a 2b 3c 4d</code>"
+)
+
+
 @router.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext, command: CommandObject):
     await state.clear()
     if command.args:
         return await show_test(m, command.args.strip().upper())
     await m.answer(
-        "👋 Salom! Bu test boti.\n\n"
-        "➕ Test yarating va kodni ulashing\n"
-        "✍️ Yoki kod bilan testni yeching",
+        "👋 <b>Salom! Bu — test boti.</b>\n\n"
+        "✍️ <b>Testni yechish</b> — kod yoki havola orqali\n"
+        "➕ <b>Test yaratish</b> — o'z testingizni tuzib, kodni ulashing\n"
+        "📊 <b>Mening testlarim</b> — natijalar va boshqaruv\n\n"
+        "⚙️ Test egasi buyruqlari: /yordam",
         reply_markup=menu_kb,
     )
 
@@ -1090,7 +1365,7 @@ async def cmd_start(m: Message, state: FSMContext, command: CommandObject):
 @router.message(F.text == "➕ Test yaratish", StateFilter(None))
 async def create_start(m: Message, state: FSMContext):
     await state.set_state(Create.title)
-    await m.answer("Test nomini yuboring:")
+    await m.answer("📝 <b>1/4-qadam</b>\nTest nomini yuboring:")
 
 
 @router.message(Create.title, F.text)
@@ -1098,6 +1373,7 @@ async def create_title(m: Message, state: FSMContext):
     await state.update_data(title=m.text.strip()[:100])
     await state.set_state(Create.file)
     await m.answer(
+        "📎 <b>2/4-qadam</b>\n"
         "Test faylini yuboring (<b>PDF</b> yoki <b>.docx</b>)\n"
         "yoki testni <b>matn</b> qilib yozib yuboring (uzun bo'lsa, bir necha xabarga bo'lib).\n\n"
         "Matnni shu ko'rinishda yozsangiz, har bir savol variantlari bilan alohida sahifada chiqadi:\n"
@@ -1106,7 +1382,7 @@ async def create_title(m: Message, state: FSMContext):
 
 
 @router.message(Create.file, F.document)
-async def create_file_step(m: Message, state: FSMContext):
+async def create_file_step(m: Message, state: FSMContext, bot: Bot):
     doc = m.document
     name = (doc.file_name or "").lower()
     mime = doc.mime_type or ""
@@ -1121,13 +1397,30 @@ async def create_file_step(m: Message, state: FSMContext):
         )
     if doc.file_size and doc.file_size > 19 * 1024 * 1024:
         return await m.answer("❌ Fayl 19 MB dan katta bo'lmasligi kerak.")
+    if kind == "docx":  # Word ichidan savol-variantlarni ajratib ko'ramiz
+        qs = None
+        try:
+            buf = io.BytesIO()
+            await bot.download(doc.file_id, destination=buf)
+            text = docx_to_text(buf.getvalue())
+            qs = parse_quiz(text) if text else None
+        except Exception:
+            text = None
+        if qs:
+            await state.update_data(
+                file_id=doc.file_id, kind="quiz", body=text, questions=json.dumps(qs, ensure_ascii=False)
+            )
+            await state.set_state(Create.key)
+            return await m.answer(
+                "📄 Word fayldan savollar o'qildi.\n" + quiz_note(qs) + "\nHar biri alohida sahifada ko'rsatiladi.\n\n" + KEY_PROMPT
+            )
+        await m.answer(
+            "ℹ️ Word fayldan savollarni ajratib bo'lmadi (raqam va harflar avtomatik ro'yxat bo'lishi mumkin). "
+            "Fayl o'z holicha ko'rsatiladi."
+        )
     await state.update_data(file_id=doc.file_id, kind=kind)
     await state.set_state(Create.key)
-    await m.answer(
-        "Javoblar kalitini yuboring.\n\n"
-        "Misol: <code>abcdabcdab</code>\n"
-        "yoki: <code>1a 2b 3c 4d</code>"
-    )
+    await m.answer(KEY_PROMPT)
 
 
 @router.message(Create.file, F.text)
@@ -1161,8 +1454,16 @@ async def text_done(c: CallbackQuery, state: FSMContext):
         await state.update_data(
             kind="quiz", body=body, file_id="", questions=json.dumps(qs, ensure_ascii=False)
         )
+        sizes = [len(q["o"]) for q in qs]
+        common = max(set(sizes), key=sizes.count)
+        odd = [str(q["q"]) for q in qs if len(q["o"]) != common]
+        note = (
+            f"\n⚠️ Variantlar soni {common} tadan farq qiladigan savollar: {', '.join(odd[:20])}. Tekshirib ko'ring."
+            if odd else ""
+        )
         await c.message.answer(
-            f"✅ {len(qs)} ta savol variantlari bilan aniqlandi. Har biri alohida sahifada ko'rsatiladi."
+            f"✅ {len(qs)} ta savol, har birida {common} tadan variant aniqlandi. "
+            f"Har biri alohida sahifada ko'rsatiladi.{note}"
         )
     else:
         await state.update_data(kind="text", body=body, file_id="", questions=None)
@@ -1170,11 +1471,7 @@ async def text_done(c: CallbackQuery, state: FSMContext):
             "ℹ️ Savol va variantlar (1. ... A) ...) formatida aniqlanmadi, matn oddiy ko'rinishda ko'rsatiladi."
         )
     await state.set_state(Create.key)
-    await c.message.answer(
-        "Javoblar kalitini yuboring.\n\n"
-        "Misol: <code>abcdabcdab</code>\n"
-        "yoki: <code>1a 2b 3c 4d</code>"
-    )
+    await c.message.answer(KEY_PROMPT)
     await c.answer()
 
 
@@ -1202,7 +1499,7 @@ async def create_key(m: Message, state: FSMContext):
                 )
     await state.update_data(key=encode_key(key))
     await state.set_state(Create.minutes)
-    await m.answer(f"✅ {len(key)} ta savol qabul qilindi.\n\n⏱ Test necha daqiqa davom etadi? (raqam)")
+    await m.answer(f"✅ {len(key)} ta javob qabul qilindi.\n\n⏱ <b>4/4-qadam</b>\nTest necha daqiqa davom etadi? (raqam)")
 
 
 @router.message(Create.minutes, F.text)
@@ -1220,13 +1517,15 @@ async def create_minutes(m: Message, state: FSMContext, bot: Bot):
     db.commit()
     await state.clear()
     me = await bot.get_me()
+    nq = len(decode_key(data["key"]))
     await m.answer(
-        f"🎉 Test tayyor!\n\n"
+        f"🎉 <b>Test tayyor!</b>\n\n"
         f"📌 Nomi: {html.escape(data['title'])}\n"
         f"🔑 Kod: <code>{code}</code>\n"
+        f"❓ Savollar: {nq} ta\n"
         f"⏱ Vaqt: {m.text} daqiqa\n\n"
-        f"Havola: https://t.me/{me.username}?start={code}\n"
-        f"Natijalar: /natijalar {code}",
+        f"🔗 Havola: https://t.me/{me.username}?start={code}\n\n"
+        f"⚙️ Boshqarish buyruqlari: /yordam",
         reply_markup=menu_kb,
     )
 
@@ -1256,6 +1555,10 @@ async def show_test(m: Message, code: str):
             "Siz bu testni allaqachon yechib bo'lgansiz.\n\n" + result_text(res),
             reply_markup=review_kb(code),
         )
+    if not att:
+        block = start_block(test, uid)
+        if block:
+            return await m.answer(block, reply_markup=menu_kb)
     if not WEBAPP_URL:
         return await m.answer("⚠️ WEBAPP_URL sozlanmagan. Bot egasiga xabar bering.")
     kb = InlineKeyboardMarkup(
@@ -1264,10 +1567,12 @@ async def show_test(m: Message, code: str):
         ]
     )
     status = "Davom ettirish uchun tugmani bosing." if att else "Tugmani bosganingizda vaqt boshlanadi."
+    nq = len(decode_key(test["answer_key"]))
     await m.answer(
-        f"📝 <b>{html.escape(test['title'])}</b>\n"
-        f"⏱ {test['minutes']} daqiqa\n\n{status}\n"
-        f"⚠️ Ilovadan chiqsangiz -1 ball ayriladi.",
+        f"📝 <b>{html.escape(test['title'])}</b>\n\n"
+        f"❓ Savollar: {nq} ta\n"
+        f"⏱ Vaqt: {test['minutes']} daqiqa\n"
+        f"⚠️ Ilovadan chiqsangiz -1 ball ayriladi\n\n{status}",
         reply_markup=kb,
     )
 
@@ -1300,14 +1605,146 @@ async def add_time(m: Message, command: CommandObject, bot: Bot):
     )
 
 
+# ---------- Yechayotganlar va chiqarish (test egasi) ----------
+PRESENCE_SEC = 45  # shuncha soniya signal bo'lmasa "aloqa yo'q"
+MAX_SHOWN = 30
+
+
+def owner_test(code, uid):
+    t = get_test(code)
+    return t if t and t["owner_id"] == uid else None
+
+
+def fmt_left(sec: float) -> str:
+    sec = max(0, int(sec))
+    h, r = divmod(sec, 3600)
+    mi, se = divmod(r, 60)
+    return f"{h}:{mi:02d}:{se:02d}" if h else f"{mi:02d}:{se:02d}"
+
+
+def active_view(code: str, note: str = ""):
+    test = get_test(code)
+    rows = db.execute(
+        "SELECT * FROM attempts WHERE code=? AND finished=0 ORDER BY started", (code,)
+    ).fetchall()
+    total = len(decode_key(test["answer_key"]))
+    now = time.time()
+    lines, kb = [], []
+    for r in rows[:MAX_SHOWN]:
+        name = r["name"] or str(r["user_id"])
+        done = len(json.loads(r["answers"] or "{}"))
+        if r["left_at"]:
+            st = "🔴 ilovadan chiqqan"
+        elif r["last_seen"] and now - r["last_seen"] <= PRESENCE_SEC:
+            st = "🟢 ilovada"
+        else:
+            st = "⚪️ aloqa yo'q"
+        pen = f" | jarima -{r['penalties'] * PENALTY}" if r["penalties"] else ""
+        lines.append(
+            f"• <b>{html.escape(name)}</b> — {st}\n"
+            f"   ⏱ {fmt_left(time_left(test, r))} | ✍️ {done}/{total}{pen}"
+        )
+        kb.append([InlineKeyboardButton(text=f"❌ {name[:24]}", callback_data=f"kick:{code}:{r['user_id']}")])
+    if len(rows) > MAX_SHOWN:
+        lines.append(f"... va yana {len(rows) - MAX_SHOWN} ta")
+    head = f"👥 <b>{html.escape(test['title'])}</b> ({code})\nHozir yechayotganlar: {len(rows)} ta\n\n"
+    body = "\n".join(lines) if lines else "Hozir hech kim yechmayapti."
+    kb.append([InlineKeyboardButton(text="🔄 Yangilash", callback_data=f"act:{code}")])
+    return note + head + body, InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@router.message(Command("yechayotganlar"))
+async def active_cmd(m: Message, command: CommandObject):
+    code = (command.args or "").strip().upper()
+    if not code:
+        mine = db.execute("SELECT code, title FROM tests WHERE owner_id=?", (m.from_user.id,)).fetchall()
+        if not mine:
+            return await m.answer("Sizda hali test yo'q.")
+        if len(mine) > 1:
+            lst = "\n".join(f"• {html.escape(t['title'])} — <code>{t['code']}</code>" for t in mine)
+            return await m.answer("Qaysi test? Masalan: <code>/yechayotganlar KOD</code>\n\n" + lst)
+        code = mine[0]["code"]
+    if not owner_test(code, m.from_user.id):
+        return await m.answer("Test topilmadi yoki u sizniki emas.")
+    text, kb = active_view(code)
+    await m.answer(text, reply_markup=kb)
+
+
+async def _show_active(c: CallbackQuery, code: str, note: str = ""):
+    text, kb = active_view(code, note)
+    try:
+        await c.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest:
+        pass  # matn o'zgarmagan
+
+
+@router.callback_query(F.data.startswith("act:"))
+async def act_cb(c: CallbackQuery):
+    code = c.data.split(":", 1)[1]
+    if not owner_test(code, c.from_user.id):
+        return await c.answer("Ruxsat yo'q", show_alert=True)
+    await _show_active(c, code)
+    await c.answer("Yangilandi")
+
+
+@router.callback_query(F.data.startswith("kick:"))
+async def kick_cb(c: CallbackQuery):
+    _, code, uid = c.data.split(":")
+    uid = int(uid)
+    if not owner_test(code, c.from_user.id):
+        return await c.answer("Ruxsat yo'q", show_alert=True)
+    att = get_attempt(code, uid)
+    if not att or att["finished"]:
+        await c.answer("Bu odam allaqachon tugatgan", show_alert=True)
+        return await _show_active(c, code)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Ha, chiqarish", callback_data=f"kickok:{code}:{uid}"),
+                InlineKeyboardButton(text="↩️ Bekor", callback_data=f"act:{code}"),
+            ]
+        ]
+    )
+    await c.message.edit_text(
+        f"❌ <b>{html.escape(att['name'] or str(uid))}</b> ni testdan chiqarasizmi?\n\n"
+        "Natijasi hozirgacha bergan javoblari bo'yicha hisoblanadi.",
+        reply_markup=kb,
+    )
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("kickok:"))
+async def kickok_cb(c: CallbackQuery, bot: Bot):
+    _, code, uid = c.data.split(":")
+    uid = int(uid)
+    if not owner_test(code, c.from_user.id):
+        return await c.answer("Ruxsat yo'q", show_alert=True)
+    att = get_attempt(code, uid)
+    if not att or att["finished"]:
+        await c.answer("Bu odam allaqachon tugatgan", show_alert=True)
+        return await _show_active(c, code)
+    name = att["name"] or str(uid)
+    await conclude(
+        bot, code, uid,
+        "🚫 Test egasi sizni testdan chiqardi. Natijangiz hozirgacha bergan javoblaringiz bo'yicha hisoblandi.\n\n",
+        kicked=True,
+    )
+    await _show_active(c, code, f"✅ {html.escape(name)} testdan chiqarildi.\n\n")
+    await c.answer("Chiqarildi")
+
+
 # ---------- Natijalar (test egasi) ----------
 @router.message(F.text == "📊 Mening testlarim", StateFilter(None))
 async def my_tests(m: Message):
     rows = db.execute("SELECT * FROM tests WHERE owner_id=?", (m.from_user.id,)).fetchall()
     if not rows:
         return await m.answer("Sizda hali test yo'q.")
-    lines = [f"• {html.escape(r['title'])} — <code>{r['code']}</code>  (/natijalar {r['code']})" for r in rows]
-    await m.answer("📚 Testlaringiz:\n\n" + "\n".join(lines))
+    lines = [
+        f"• {html.escape(r['title'])}{' 🔒' if r['closed'] else ''} — <code>{r['code']}</code>\n"
+        f"   /natijalar {r['code']} · /yechayotganlar {r['code']}"
+        for r in rows
+    ]
+    await m.answer("📚 <b>Testlaringiz:</b>\n\n" + "\n".join(lines) + "\n\n⚙️ Boshqa buyruqlar: /yordam")
 
 
 @router.message(Command("natijalar"))
@@ -1325,10 +1762,309 @@ async def results(m: Message, command: CommandObject):
     for i, r in enumerate(rows, 1):
         st = (
             f"{r['correct']}/{r['total']}, jarima -{r['penalties'] * PENALTY}, ball {r['score']}"
+            + (" (chiqarilgan)" if r["result"] and json.loads(r["result"]).get("kicked") else "")
             if r["finished"] else "yechmoqda..."
         )
         lines.append(f"{i}. {html.escape(r['name'] or '')} — {st}")
     await m.answer(f"📊 <b>{html.escape(test['title'])}</b>\n\n" + "\n".join(lines))
+
+
+# ---------- Test egasi: boshqaruv buyruqlari ----------
+HELP_TEXT = (
+    "⚙️ <b>Test egasi buyruqlari</b>\n\n"
+    "👥 /yechayotganlar KOD — hozir kim yechayotgani, chiqarish\n"
+    "📊 /natijalar KOD — barcha natijalar\n"
+    "🏆 /reyting KOD — eng yaxshi natijalar\n"
+    "📉 /tahlil KOD — eng ko'p xato qilingan savollar\n"
+    "📥 /eksport KOD — natijalarni Excel (CSV) fayl qilib olish\n"
+    "⏱ /vaqt KOD DAQIQA — vaqt qo'shish\n"
+    "🔒 /yopish KOD — yangi yechuvchilarni to'xtatish\n"
+    "🔓 /ochish KOD — qayta ochish\n"
+    "🗓 /jadval KOD 20.11 20:00 21:00 — ochiq turish vaqti (o'chirish: /jadval KOD off)\n"
+    "🔀 /aralash KOD 0|1|2 — 0: o'chiq, 1: savollar, 2: savollar va variantlar\n"
+    "🔁 /qayta KOD — kimgadir qayta yechishga ruxsat\n"
+    "📄 /nusxa KOD — testdan yangi kodli nusxa"
+)
+
+
+@router.message(Command("yordam"))
+async def help_cmd(m: Message):
+    await m.answer(HELP_TEXT)
+
+
+async def own_test(m: Message, command: CommandObject, usage: str, min_args: int = 1):
+    """Buyruq argumentlarini tekshiradi. (kod, test, qolgan_argumentlar) yoki None."""
+    args = (command.args or "").split()
+    if len(args) < min_args:
+        await m.answer("Ishlatish: <code>" + usage + "</code>")
+        return None
+    code = args[0].upper()
+    test = owner_test(code, m.from_user.id)
+    if not test:
+        await m.answer("Test topilmadi yoki u sizniki emas.")
+        return None
+    return code, test, args[1:]
+
+
+def csv_safe(v) -> str:
+    v = "" if v is None else str(v)
+    return "'" + v if v[:1] in ("=", "+", "-", "@") else v
+
+
+@router.message(Command("eksport"))
+async def export_cmd(m: Message, command: CommandObject):
+    r = await own_test(m, command, "/eksport KOD")
+    if not r:
+        return
+    code, test, _ = r
+    rows = db.execute(
+        "SELECT * FROM attempts WHERE code=? ORDER BY finished DESC, score DESC", (code,)
+    ).fetchall()
+    if not rows:
+        return await m.answer("Hali hech kim yechmagan.")
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";")
+    w.writerow(["№", "Ism", "To'g'ri", "Jami", "Foiz", "Jarima", "Ball", "Holat", "Boshlagan", "Tugatgan", "Sarflangan (daq)"])
+    for i, a in enumerate(rows, 1):
+        res = json.loads(a["result"]) if a["result"] else {}
+        if a["finished"]:
+            holat = "chiqarilgan" if res.get("kicked") else "tugatgan"
+            pct = round(a["score"] / a["total"] * 100) if a["total"] else 0
+            spent = round((a["finished_at"] - a["started"]) / 60, 1) if a["finished_at"] else ""
+            row = [a["correct"], a["total"], pct, a["penalties"] * PENALTY, a["score"], holat,
+                   fmt_dt(a["started"]), fmt_dt(a["finished_at"]) if a["finished_at"] else "", spent]
+        else:
+            row = ["", "", "", a["penalties"] * PENALTY, "", "yechmoqda", fmt_dt(a["started"]), "", ""]
+        w.writerow([i, csv_safe(a["name"])] + row)
+    data = ("\ufeff" + buf.getvalue()).encode("utf-8")
+    await m.answer_document(
+        BufferedInputFile(data, filename=f"{code}_natijalar.csv"),
+        caption=f"📥 <b>{html.escape(test['title'])}</b>: {len(rows)} ta natija\n(Excel yoki Google Sheets'da oching)",
+    )
+
+
+@router.message(Command("reyting"))
+async def rating_cmd(m: Message, command: CommandObject):
+    r = await own_test(m, command, "/reyting KOD")
+    if not r:
+        return
+    code, test, _ = r
+    rows = db.execute(
+        "SELECT * FROM attempts WHERE code=? AND finished=1 "
+        "ORDER BY score DESC, COALESCE(finished_at, 1e18) ASC LIMIT 15",
+        (code,),
+    ).fetchall()
+    if not rows:
+        return await m.answer("Hali hech kim tugatmagan.")
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, a in enumerate(rows):
+        pct = round(a["score"] / a["total"] * 100) if a["total"] else 0
+        mark = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{mark} {html.escape(a['name'] or '')} — <b>{a['score']}/{a['total']}</b> ({pct}%)")
+    await m.answer(f"🏆 <b>{html.escape(test['title'])}</b> reytingi\n\n" + "\n".join(lines))
+
+
+@router.message(Command("tahlil"))
+async def hard_cmd(m: Message, command: CommandObject):
+    r = await own_test(m, command, "/tahlil KOD")
+    if not r:
+        return
+    code, test, _ = r
+    rows = db.execute(
+        "SELECT result FROM attempts WHERE code=? AND finished=1 AND result IS NOT NULL", (code,)
+    ).fetchall()
+    n = len(rows)
+    if n == 0:
+        return await m.answer("Hali hech kim tugatmagan.")
+    cnt = Counter()
+    for a in rows:
+        for x in json.loads(a["result"]).get("wrong", []):
+            cnt[x["q"]] += 1
+    if not cnt:
+        return await m.answer("🎉 Hamma barcha savollarga to'g'ri javob bergan.")
+    qd = {x["q"]: x for x in (qdata_for(test) or [])}
+    lines = []
+    for q, c in cnt.most_common(10):
+        line = f"<b>{q}-savol</b> — {round(c / n * 100)}% xato ({c}/{n})"
+        if q in qd:
+            line += f"\n   <i>{html.escape(qd[q]['t'][:60])}</i>"
+        lines.append(line)
+    await m.answer(
+        f"📉 <b>{html.escape(test['title'])}</b>\nEng ko'p xato qilingan savollar ({n} kishi tugatgan):\n\n"
+        + "\n".join(lines)
+    )
+
+
+async def _set_closed(m: Message, command: CommandObject, value: int):
+    r = await own_test(m, command, "/yopish KOD" if value else "/ochish KOD")
+    if not r:
+        return
+    code, test, _ = r
+    db.execute("UPDATE tests SET closed=? WHERE code=?", (value, code))
+    db.commit()
+    await m.answer(
+        f"🔒 <b>{html.escape(test['title'])}</b> yopildi. Yangi yechuvchilar kira olmaydi, "
+        "boshlaganlar davom ettiradi." if value else
+        f"🔓 <b>{html.escape(test['title'])}</b> qayta ochildi."
+    )
+
+
+@router.message(Command("yopish"))
+async def close_cmd(m: Message, command: CommandObject):
+    await _set_closed(m, command, 1)
+
+
+@router.message(Command("ochish"))
+async def open_cmd(m: Message, command: CommandObject):
+    await _set_closed(m, command, 0)
+
+
+@router.message(Command("nusxa"))
+async def copy_cmd(m: Message, command: CommandObject, bot: Bot):
+    r = await own_test(m, command, "/nusxa KOD")
+    if not r:
+        return
+    code, test, _ = r
+    new = new_code()
+    db.execute(
+        "INSERT INTO tests(code,owner_id,title,file_id,kind,answer_key,minutes,created,body,questions,shuffle) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        (new, test["owner_id"], (test["title"] + " (nusxa)")[:100], test["file_id"], test["kind"],
+         test["answer_key"], test["minutes"], time.time(), test["body"], test["questions"], test["shuffle"] or 0),
+    )
+    db.commit()
+    me = await bot.get_me()
+    await m.answer(
+        f"📄 Nusxa tayyor!\n\n🔑 Yangi kod: <code>{new}</code>\n"
+        f"🔗 https://t.me/{me.username}?start={new}"
+    )
+
+
+def parse_local(day_month: str, hhmm: str):
+    a = re.fullmatch(r"(\d{1,2})\.(\d{1,2})", day_month)
+    b = re.fullmatch(r"(\d{1,2}):(\d{2})", hhmm)
+    if not a or not b:
+        return None
+    year = time.gmtime(time.time() + TZ_OFFSET * 3600).tm_year
+    try:
+        dt = datetime.datetime(year, int(a.group(2)), int(a.group(1)), int(b.group(1)), int(b.group(2)),
+                               tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    return dt.timestamp() - TZ_OFFSET * 3600
+
+
+@router.message(Command("jadval"))
+async def schedule_cmd(m: Message, command: CommandObject):
+    usage = "/jadval KOD 20.11 20:00 21:00"
+    r = await own_test(m, command, usage + "  (o'chirish: /jadval KOD off)", min_args=2)
+    if not r:
+        return
+    code, test, rest = r
+    if rest[0].lower() == "off":
+        db.execute("UPDATE tests SET opens_at=NULL, closes_at=NULL WHERE code=?", (code,))
+        db.commit()
+        return await m.answer("🗓 Jadval o'chirildi. Test har doim ochiq.")
+    if len(rest) != 3:
+        return await m.answer("Ishlatish: <code>" + usage + "</code>")
+    start, end = parse_local(rest[0], rest[1]), parse_local(rest[0], rest[2])
+    if start is None or end is None or end <= start:
+        return await m.answer("❌ Sana yoki vaqt noto'g'ri. Masalan: <code>" + usage + "</code>")
+    db.execute("UPDATE tests SET opens_at=?, closes_at=? WHERE code=?", (start, end, code))
+    db.commit()
+    await m.answer(
+        f"🗓 <b>{html.escape(test['title'])}</b>\nOchiladi: {fmt_dt(start)}\nYopiladi: {fmt_dt(end)}\n"
+        f"(vaqt UTC+{TZ_OFFSET:g} bo'yicha). Yopilgandan keyin yangi yechuvchilar kira olmaydi."
+    )
+
+
+SHUFFLE_INFO = {"0": "o'chiq", "1": "savollar tartibi aralashadi", "2": "savollar va variantlar aralashadi"}
+
+
+@router.message(Command("aralash"))
+async def shuffle_cmd(m: Message, command: CommandObject):
+    r = await own_test(m, command, "/aralash KOD 0|1|2", min_args=2)
+    if not r:
+        return
+    code, test, rest = r
+    if rest[0] not in SHUFFLE_INFO:
+        return await m.answer("Ishlatish: <code>/aralash KOD 0|1|2</code>\n0 — o'chiq, 1 — savollar, 2 — savollar va variantlar")
+    if test["kind"] != "quiz":
+        return await m.answer("Aralashtirish faqat savol-savol ko'rinishidagi testlar uchun ishlaydi.")
+    if db.execute("SELECT 1 FROM attempts WHERE code=? LIMIT 1", (code,)).fetchone():
+        return await m.answer("Kimdir testni boshlab bo'lgan, endi o'zgartirib bo'lmaydi. /nusxa orqali yangi test oching.")
+    db.execute("UPDATE tests SET shuffle=? WHERE code=?", (int(rest[0]), code))
+    db.commit()
+    await m.answer(f"🔀 Aralashtirish: {SHUFFLE_INFO[rest[0]]}.")
+
+
+def retake_view(code: str, note: str = ""):
+    test = get_test(code)
+    rows = db.execute(
+        "SELECT * FROM attempts WHERE code=? AND finished=1 ORDER BY COALESCE(finished_at, 0) DESC LIMIT 30",
+        (code,),
+    ).fetchall()
+    kb = [
+        [InlineKeyboardButton(
+            text=f"🔁 {(a['name'] or str(a['user_id']))[:22]} — {a['score']}/{a['total']}",
+            callback_data=f"retake:{code}:{a['user_id']}",
+        )]
+        for a in rows
+    ]
+    text = f"{note}🔁 <b>{html.escape(test['title'])}</b>\n"
+    text += "Qayta yechishga ruxsat berish uchun ismni bosing:" if rows else "Hali hech kim tugatmagan."
+    return text, InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@router.message(Command("qayta"))
+async def retake_cmd(m: Message, command: CommandObject):
+    r = await own_test(m, command, "/qayta KOD")
+    if not r:
+        return
+    text, kb = retake_view(r[0])
+    await m.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("retake:"))
+async def retake_cb(c: CallbackQuery, bot: Bot):
+    _, code, uid = c.data.split(":")
+    uid = int(uid)
+    test = owner_test(code, c.from_user.id)
+    if not test:
+        return await c.answer("Ruxsat yo'q", show_alert=True)
+    att = get_attempt(code, uid)
+    if not att or not att["finished"]:
+        return await c.answer("Bu odam testni tugatmagan", show_alert=True)
+    name = att["name"] or str(uid)
+    db.execute(
+        "INSERT INTO attempts_old(code,user_id,name,started,finished,correct,total,penalties,score,answers,"
+        "left_at,result,last_seen,finished_at,archived) "
+        "SELECT code,user_id,name,started,finished,correct,total,penalties,score,answers,"
+        "left_at,result,last_seen,finished_at,? FROM attempts WHERE code=? AND user_id=?",
+        (time.time(), code, uid),
+    )
+    db.execute("DELETE FROM attempts WHERE code=? AND user_id=?", (code, uid))
+    db.commit()
+    kb = None
+    if WEBAPP_URL:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="📝 Testni ochish", web_app=WebAppInfo(url=f"{WEBAPP_URL}/app?code={code}"))]]
+        )
+    try:
+        await bot.send_message(
+            uid,
+            f"🔁 Test egasi sizga <b>{html.escape(test['title'])}</b> testini qayta yechishga ruxsat berdi.",
+            reply_markup=kb,
+        )
+    except Exception:
+        pass
+    text, kb2 = retake_view(code, f"✅ {html.escape(name)} ga ruxsat berildi.\n\n")
+    try:
+        await c.message.edit_text(text, reply_markup=kb2)
+    except TelegramBadRequest:
+        pass
+    await c.answer("Ruxsat berildi")
 
 
 # ----------------------------- ISHGA TUSHIRISH -----------------------------
