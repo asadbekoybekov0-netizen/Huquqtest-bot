@@ -178,13 +178,13 @@ def parse_answers(text: str) -> dict:
     return {i + 1: l for i, l in enumerate(re.findall(r"[a-z]", text))}
 
 
-# Raqam belgisi (savol tartibi) yoki harf belgisi (variant): "7." / "№7." / "7-savol" / "A." / "B)" / "C,"
+# Raqam belgisi (savol tartibi) yoki KATTA harf belgisi (variant): "7." / "№7." / "7-savol" / "A." / "B)" / "C,"
 TOKEN_RE = re.compile(
     r"(?<!\d)(?:№\s*|#\s*)?(\d{1,3})\s*(?:[.)]|-\s*[Ss]avol\s*[.:)]?)(?!\d)"
-    r"|(?<![A-Za-z0-9'ʻʼ’`])([A-Ja-j])\s*[.),]"
+    r"|(?<![A-Za-z0-9'ʻʼ’`])([A-J])\s*[.),]"
 )
 _PUNCT = str.maketrans({"）": ")", "．": ".", "。": ".", "：": ":", "，": ",", "․": ".", "﹒": ".", "‧": "."})
-_LOOK = str.maketrans("АВСЕаес", "ABCEaec")
+_LOOK = str.maketrans("АВСЕ", "ABCE")
 
 
 def normalize_text(text: str) -> str:
@@ -194,7 +194,7 @@ def normalize_text(text: str) -> str:
     t = re.sub(r"[\u200b-\u200f\u2060\ufeff\u00ad]", "", t)
     t = t.translate(_PUNCT)
     # variant belgisi o'rnidagi kirill А, В, С, Е ("А)" "В." ...) lotinchaga o'giriladi
-    t = re.sub(r"(?<![\w'ʻʼ’])([АВСЕаес])(?=\s*[.),])", lambda m: m.group(1).translate(_LOOK), t)
+    t = re.sub(r"(?<![\w'ʻʼ’])([АВСЕ])(?=\s*[.),])", lambda m: m.group(1).translate(_LOOK), t)
     return t
 
 
@@ -245,7 +245,7 @@ def _scan(t: str, first=None, gap: int = 0):
         if cur is None:
             continue
         expect = chr(ord("a") + cur["n"])
-        if let.lower() == expect:
+        if let == expect.upper():  # faqat KATTA harf
             close(m.start())
             cur["n"] += 1
             kind, start = expect, m.end()
@@ -258,12 +258,14 @@ def _valid(qs) -> bool:
     return bool(qs) and all(len(q["o"]) >= 2 and q["t"] for q in qs)
 
 
-def parse_quiz(text: str):
-    """
-    Savollarni matndan ajratadi. Qatorlarga bo'lingan ham, hammasi bir qatorda
-    ketma-ket yozilgan ham ishlaydi. Raqamlash 1 dan boshlanmasa yoki orada raqam
-    tushib qolgan bo'lsa ham, savollar 1 dan qayta raqamlanadi.
-    """
+def _first_number(t: str):
+    for m in TOKEN_RE.finditer(t):
+        if m.group(1) is not None:
+            return int(m.group(1))
+    return None
+
+
+def _parse_joined(text: str):
     t = normalize_text(text)
     starts = [1]
     for m in TOKEN_RE.finditer(t):
@@ -284,6 +286,42 @@ def parse_quiz(text: str):
     return best
 
 
+def _parse_parts(parts):
+    """Har bir xabarni alohida tekshiradi: undagi birinchi raqam — o'sha savolning raqami."""
+    allq = []
+    for part in parts:
+        t = normalize_text(part)
+        first = _first_number(t)
+        if first is None:
+            return None
+        qs = _scan(t, first, 0)
+        if not qs:
+            return None
+        allq.extend(qs)
+    if not _valid(allq):
+        return None
+    for i, q in enumerate(allq, 1):
+        q["q"] = i
+        q.pop("n", None)
+    return allq
+
+
+def parse_quiz(text: str, parts=None):
+    """
+    Savollarni matndan ajratadi. Savol — raqam (7. yoki 7)), variant — KATTA lotin harfi
+    (A) yoki A.), kichik harf variant hisoblanmaydi. Qatorlarga bo'lingan ham, bir qatorda
+    ketma-ket yozilgan ham ishlaydi. Raqamlash 1 dan boshlanmasa yoki ketma-ket bo'lmasa,
+    savollar yuborilish tartibida 1 dan qayta raqamlanadi. Agar har bir savol alohida
+    xabarda yuborilgan bo'lsa (parts), har xabardagi birinchi raqam shu savol raqami hisoblanadi.
+    """
+    best = _parse_joined(text)
+    if parts and len(parts) > 1:
+        alt = _parse_parts(parts)
+        if alt and (best is None or len(alt) > len(best)):
+            best = alt
+    return best
+
+
 def diagnose_quiz(text: str) -> str:
     """Savollar ajratilmaganda sababini tushuntiradi."""
     t = normalize_text(text)
@@ -299,9 +337,11 @@ def diagnose_quiz(text: str) -> str:
         + (f"{len(nums)} ta, birinchilari: {', '.join(map(str, nums[:10]))}" if nums else "topilmadi ❌")
     )
     out.append(
-        "• Variant belgilari (<code>A)</code> yoki <code>A.</code>): "
+        "• Variant belgilari (KATTA harf: <code>A)</code> yoki <code>A.</code>): "
         + (", ".join(f"{k}×{v}" for k, v in sorted(lets.items())) if lets else "topilmadi ❌")
     )
+    if not lets and re.search(r"(?<![A-Za-z0-9'ʻʼ’`])[a-j]\s*[.),]", t):
+        out.append("• Kichik harfli variantlar (a), b)...) topildi, lekin bot faqat <b>KATTA</b> harfni (A), B)...) taniydi ❗")
     odd = sorted({f"U+{ord(c):04X}" for c in text if unicodedata.category(c) in ("Cf", "Zs") and c != " "})
     if odd:
         out.append("• Ko'rinmas belgilar bor: " + ", ".join(odd[:6]) + " (bot ularni tozalaydi)")
@@ -317,7 +357,7 @@ def diagnose_quiz(text: str) -> str:
     out.append(f"• Matn boshi: «{head}»")
     out.append(
         "\nTo'g'ri ko'rinish: <code>1. Savol matni</code> va keyin <code>A) variant</code>, "
-        "<code>B) variant</code>... (lotin harflari, A dan boshlab ketma-ket)."
+        "<code>B) variant</code>... (KATTA lotin harflari, A dan boshlab ketma-ket)."
     )
     return "\n".join(out)
 
@@ -354,7 +394,10 @@ def quiz_note(qs) -> str:
     )
     raws = [q.get("raw", q["q"]) for q in qs]
     if any(r != q["q"] for r, q in zip(raws, qs)):
-        note += f"\nℹ️ Savollar 1 dan qayta raqamlandi (asl raqamlar: {min(raws)}–{max(raws)})."
+        if all(x < y for x, y in zip(raws, raws[1:])):
+            note += f"\nℹ️ Savollar 1 dan qayta raqamlandi (asl raqamlar: {min(raws)}–{max(raws)})."
+        else:
+            note += "\nℹ️ Savollar yuborilish tartibi bo'yicha 1 dan qayta raqamlandi."
     return f"✅ {len(qs)} ta savol, har birida {common} tadan variant aniqlandi.{note}"
 
 
@@ -405,6 +448,7 @@ def finalize(code: str, uid: int, kicked: bool = False):
         "score": score,
         "wrong": wrong,
         "kicked": kicked,
+        "spent": int(min(max(time.time() - att["started"], 0), test["minutes"] * 60)),
         "items": [
             {"q": n, "given": given.get(n, ""), "right": l}
             for n, l in sorted(key.items())
@@ -417,6 +461,11 @@ def finalize(code: str, uid: int, kicked: bool = False):
     )
     db.commit()
     return res, True
+
+
+def fmt_spent(sec: int) -> str:
+    m, sc = divmod(max(0, int(sec)), 60)
+    return f"{m} daq {sc} s" if m else f"{sc} s"
 
 
 def bar(pct: int, n: int = 10) -> str:
@@ -434,6 +483,8 @@ def result_text(r: dict, rank=None) -> str:
         f"🚪 Chiqib ketish jarimasi: -{r['penalties']}\n"
         f"🏆 Yakuniy ball: <b>{r['score']}</b>\n"
     )
+    if r.get("spent") is not None:
+        t += f"⏱ Sarflangan vaqt: {fmt_spent(r['spent'])}\n"
     if rank and rank[0]:
         t += f"📈 Hozirgi reyting: <b>{rank[0]}-o'rin</b> ({rank[1]} kishidan)\n"
     if r.get("kicked"):
@@ -867,6 +918,36 @@ main{padding-bottom:90px}
 .donut b{position:absolute;left:0;top:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;font-size:30px}
 .conf{position:fixed;top:-30px;font-size:22px;animation:fall 2.8s linear forwards;z-index:30;pointer-events:none}
 @keyframes fall{to{transform:translateY(115vh) rotate(540deg)}}
+.rhero{background:linear-gradient(135deg,#161a4d,#2d33a0);color:#fff;border-radius:24px;padding:20px 16px 18px;text-align:center;box-shadow:0 10px 26px rgba(22,26,77,.35);animation:qin .4s ease}
+.rtitle{font-weight:700;font-size:18px;margin-bottom:4px;word-break:break-word}
+.rkick{background:rgba(229,57,53,.25);border:1px solid #e53935;border-radius:12px;padding:6px 10px;font-weight:600;font-size:13px;margin:8px 0}
+.rhero .donut{margin:10px auto 8px}
+.rhero .donut b{animation:pop .7s cubic-bezier(.2,1.4,.4,1) both}
+.rverdict{font-weight:700;font-size:18px}
+.rsub{opacity:.8;font-size:14px;margin-top:4px}
+.rtiles{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:14px 0}
+.tile{background:var(--qcard);border-radius:16px;padding:12px 4px;text-align:center;box-shadow:0 6px 16px var(--qshadow);animation:pop .5s ease both}
+.tile:nth-child(2){animation-delay:.08s}
+.tile:nth-child(3){animation-delay:.16s}
+.tile:nth-child(4){animation-delay:.24s}
+.tile span{display:block;font-size:18px}
+.tile b{display:block;font-size:22px;margin-top:2px}
+.tile i{display:block;font-style:normal;font-size:11px;color:var(--qmuted);margin-top:2px}
+@keyframes pop{from{opacity:0;transform:translateY(10px) scale(.92)}to{opacity:1;transform:none}}
+.rpen{background:var(--badbg);border-radius:14px;padding:10px 12px;text-align:center;margin-bottom:14px;font-size:14px}
+.rsec{background:var(--qcard);border-radius:20px;padding:14px 14px 6px;box-shadow:0 6px 16px var(--qshadow);margin-bottom:16px}
+.rh{font-weight:700;margin-bottom:6px}
+.erow{display:flex;align-items:center;gap:10px;padding:9px 0}
+.erow + .erow{border-top:1px solid var(--qline)}
+.en{flex:none;width:30px;height:30px;border-radius:50%;background:var(--badbg);color:#e53935;font-weight:700;font-size:13px;display:flex;align-items:center;justify-content:center}
+.ech{display:flex;align-items:center;flex-wrap:wrap;gap:6px}
+.chip{padding:4px 10px;border-radius:999px;font-size:13px;font-weight:600}
+.chip.bad{background:var(--badbg);color:#e53935}
+.chip.good{background:var(--goodbg);color:#3aa655}
+.chip.none{background:var(--qsoft);color:var(--qmuted)}
+.arr{color:var(--qmuted)}
+.big.grad{background:linear-gradient(135deg,var(--pri),#7b86ff);color:#fff;box-shadow:0 8px 18px rgba(91,103,232,.35);margin-bottom:10px}
+.big.ghost{background:var(--qcard);color:var(--qtx);border:1px solid var(--qline)}
 .docx{padding:14px;overflow-x:auto}
 .docx img{max-width:100%}
 .txt{white-space:pre-wrap;font-size:17px;line-height:1.55;word-wrap:break-word}
@@ -919,19 +1000,24 @@ footer{position:fixed;left:0;right:0;bottom:0;background:var(--bg);border-top:1p
   <div style="margin-top:18px"><button class="big" id="q-finish">✅ Testni yakunlash</button></div>
 </div>
 
-<div id="s-res" class="hidden">
-  <div class="card">
-    <h2 id="r-title"></h2>
-    <div id="r-kick" class="hidden" style="color:#e53935;font-weight:600;margin-bottom:8px">🚫 Test egasi tomonidan tugatildi</div>
+<div id="s-res" class="hidden qwrap">
+  <div class="rhero">
+    <div class="rtitle" id="r-title"></div>
+    <div id="r-kick" class="hidden rkick">🚫 Test egasi tomonidan tugatildi</div>
     <div class="donut" id="r-donut"></div>
-    <div class="big-n" id="r-main"></div>
-    <div>✅ To'g'ri javoblar</div>
-    <p>🚪 Chiqib ketish jarimasi: <b id="r-pen"></b></p>
-    <p>🏆 Yakuniy ball: <b id="r-score"></b></p>
+    <div class="rverdict" id="r-verdict"></div>
+    <div class="rsub" id="r-sub"></div>
   </div>
-  <div class="card" id="r-wrongbox"><h2>❌ Xatolar</h2><div id="r-wrong"></div></div>
-  <div style="padding:0 16px 10px"><button class="big" id="revbtn">🔍 Xatolarni tahlil qilish</button></div>
-  <div style="padding:0 16px 30px"><button class="big" id="closebtn" style="background:var(--sec);color:var(--tx)">Yopish</button></div>
+  <div class="rtiles">
+    <div class="tile"><span>✅</span><b id="r-ok">0</b><i>To'g'ri</i></div>
+    <div class="tile"><span>❌</span><b id="r-bad">0</b><i>Xato</i></div>
+    <div class="tile"><span>⬜</span><b id="r-none">0</b><i>Javobsiz</i></div>
+    <div class="tile"><span>🏆</span><b id="r-score">0</b><i>Ball</i></div>
+  </div>
+  <div class="rpen hidden" id="r-penbox">🚪 Chiqib ketish jarimasi: <b id="r-pen"></b></div>
+  <div class="rsec hidden" id="r-wrongbox"><div class="rh">❌ Xatolar</div><div id="r-wrong"></div></div>
+  <button class="big grad" id="revbtn">🔍 Xatolarni tahlil qilish</button>
+  <button class="big ghost" id="closebtn">Yopish</button>
 </div>
 
 <div id="s-rev" class="hidden">
@@ -1118,34 +1204,69 @@ $("tab-doc").onclick = () => setTab("doc");
 $("tab-ans").onclick = () => setTab("ans");
 
 let RES = null, revDocLoaded = false;
+function ensureOrder() {
+  if (isQuiz() && !SEQ.length) { QD = {}; S.qdata.forEach(x => { QD[x.q] = x; }); prepOrder(); }
+}
+function fmtSpent(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const m = Math.floor(sec / 60), s = sec % 60;
+  return (m ? m + " daq " : "") + s + " s";
+}
+function chipEl(cls, txt) {
+  const c = document.createElement("span"); c.className = "chip " + cls; c.textContent = txt;
+  return c;
+}
 function showResult(r) {
   finished = true;
   RES = r;
   try { tg.disableClosingConfirmation(); } catch (e) {}
+  ensureOrder();
   $("r-title").textContent = r.title;
   $("r-kick").classList.toggle("hidden", !r.kicked);
-  const pct = r.total ? Math.round(r.score / r.total * 100) : 0;
+  const total = r.total, pct = total ? Math.round(r.score / total * 100) : 0;
   const col = pct >= 80 ? "#2fb344" : (pct >= 50 ? "#f5a623" : "#e53935");
   const C = 2 * Math.PI * 54;
   $("r-donut").innerHTML = '<svg width="140" height="140" viewBox="0 0 140 140">' +
-    '<circle cx="70" cy="70" r="54" fill="none" stroke="rgba(128,128,128,.25)" stroke-width="14"/>' +
+    '<circle cx="70" cy="70" r="54" fill="none" stroke="rgba(255,255,255,.18)" stroke-width="14"/>' +
     '<circle cx="70" cy="70" r="54" fill="none" stroke="' + col + '" stroke-width="14" stroke-linecap="round" ' +
     'stroke-dasharray="' + C.toFixed(1) + '" stroke-dashoffset="' + C.toFixed(1) + '"/></svg>' +
-    '<b style="color:' + col + '">' + pct + '%</b>';
+    '<b style="color:#fff">' + pct + '%</b>';
   setTimeout(() => {
     const arc = $("r-donut").querySelectorAll("circle")[1];
     if (arc) { arc.style.transition = "stroke-dashoffset 1s ease"; arc.style.strokeDashoffset = (C * (1 - pct / 100)).toFixed(1); }
   }, 60);
-  $("r-main").textContent = r.correct + "/" + r.total;
-  $("r-pen").textContent = "-" + r.penalties;
+  const wrong = r.wrong || [];
+  const none = wrong.filter(x => !x.given).length;
+  $("r-ok").textContent = r.correct;
+  $("r-bad").textContent = wrong.length - none;
+  $("r-none").textContent = none;
   $("r-score").textContent = r.score;
+  $("r-verdict").textContent = pct === 100 ? "Mukammal! 🏆" : pct >= 80 ? "Ajoyib natija! 🎉" : pct >= 60 ? "Yaxshi natija 👍" :
+    pct >= 40 ? "Yomon emas, takrorlash foyda beradi 📚" : "Mavzuni qayta o'qib chiqing 💪";
+  $("r-sub").textContent = r.correct + "/" + total + " to'g'ri javob" + (r.spent != null ? "  ·  ⏱ " + fmtSpent(r.spent) : "");
+  $("r-penbox").classList.toggle("hidden", !(r.penalties > 0));
+  $("r-pen").textContent = "-" + r.penalties;
   const w = $("r-wrong"); w.innerHTML = "";
-  if (!r.wrong.length) { w.textContent = "🎉 Xatosiz!"; }
-  r.wrong.forEach(x => {
-    const d = document.createElement("div"); d.className = "wrong";
-    d.textContent = x.q + ") siz: " + (x.given ? x.given.toUpperCase() : "—") + " → to'g'ri: " + x.right.toUpperCase();
-    w.appendChild(d);
-  });
+  $("r-wrongbox").classList.toggle("hidden", wrong.length === 0);
+  const disp = (q, l) => {
+    if (!l) return "—";
+    const i = (isQuiz() && PERM[q]) ? PERM[q].indexOf(l) : -1;
+    return (i >= 0 ? String.fromCharCode(97 + i) : l).toUpperCase();
+  };
+  const pos = q => { const i = isQuiz() ? SEQ.indexOf(q) : -1; return i >= 0 ? i + 1 : q; };
+  wrong.map(x => ({n: pos(x.q), g: disp(x.q, x.given), t: disp(x.q, x.right), none: !x.given}))
+    .sort((a, b) => a.n - b.n)
+    .forEach(e => {
+      const row = document.createElement("div"); row.className = "erow";
+      const n = document.createElement("span"); n.className = "en"; n.textContent = e.n;
+      const ch = document.createElement("div"); ch.className = "ech";
+      ch.appendChild(e.none ? chipEl("none", "Javobsiz") : chipEl("bad", "Sizniki: " + e.g));
+      const ar = document.createElement("span"); ar.className = "arr"; ar.textContent = "→";
+      ch.appendChild(ar);
+      ch.appendChild(chipEl("good", "To'g'ri: " + e.t));
+      row.appendChild(n); row.appendChild(ch);
+      w.appendChild(row);
+    });
   show("res");
   if (pct >= 80 && !r.kicked) { confetti(); haptic("success"); }
 }
@@ -1309,7 +1430,7 @@ function renderReviewQuiz(onlyWrong) {
 /* ---- Xatolar tahlili ---- */
 function openReview() {
   if (isQuiz()) {
-    if (!SEQ.length) { QD = {}; S.qdata.forEach(x => { QD[x.q] = x; }); prepOrder(); }
+    ensureOrder();
     $("rt-ans").textContent = "📋 Hammasi"; $("rt-doc").textContent = "⚠️ Faqat xatolar";
     show("rev"); setRevTab("ans"); return;
   }
@@ -1461,7 +1582,9 @@ async def create_title(m: Message, state: FSMContext):
         "📎 <b>2/4-qadam</b>\n"
         "Test faylini yuboring (<b>PDF</b> yoki <b>.docx</b>)\n"
         "yoki testni <b>matn</b> qilib yozib yuboring (uzun bo'lsa, bir necha xabarga bo'lib).\n\n"
-        "Matnni shu ko'rinishda yozsangiz, har bir savol variantlari bilan alohida sahifada chiqadi:\n"
+        "Matnni shu ko'rinishda yozsangiz, har bir savol variantlari bilan alohida sahifada chiqadi "
+        "(variant harflari faqat <b>KATTA</b> bo'lsin; har bir savolni alohida xabar qilib yuborsangiz ham bo'ladi, "
+        "xabardagi birinchi raqam shu savolning raqami):\n"
         "<code>1. Savol matni\nA) variant\nB) variant\nC) variant\nD) variant</code>"
     )
 
@@ -1535,22 +1658,12 @@ async def text_done(c: CallbackQuery, state: FSMContext):
     if not parts:
         return await c.answer("Avval matn yuboring", show_alert=True)
     body = "\n".join(parts)
-    qs = parse_quiz(body)
+    qs = parse_quiz(body, parts)
     if qs:
         await state.update_data(
             kind="quiz", body=body, file_id="", questions=json.dumps(qs, ensure_ascii=False)
         )
-        sizes = [len(q["o"]) for q in qs]
-        common = max(set(sizes), key=sizes.count)
-        odd = [str(q["q"]) for q in qs if len(q["o"]) != common]
-        note = (
-            f"\n⚠️ Variantlar soni {common} tadan farq qiladigan savollar: {', '.join(odd[:20])}. Tekshirib ko'ring."
-            if odd else ""
-        )
-        await c.message.answer(
-            f"✅ {len(qs)} ta savol, har birida {common} tadan variant aniqlandi. "
-            f"Har biri alohida sahifada ko'rsatiladi.{note}"
-        )
+        await c.message.answer(quiz_note(qs) + "\nHar biri alohida sahifada ko'rsatiladi.")
     else:
         await state.update_data(kind="text", body=body, file_id="", questions=None)
         await c.message.answer(
