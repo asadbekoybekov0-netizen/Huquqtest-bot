@@ -71,12 +71,13 @@ db.executescript(
 CREATE TABLE IF NOT EXISTS tests(
     code TEXT PRIMARY KEY, owner_id INTEGER, title TEXT, file_id TEXT,
     kind TEXT, answer_key TEXT, minutes INTEGER, created REAL, body TEXT, questions TEXT,
-    shuffle INTEGER DEFAULT 0, closed INTEGER DEFAULT 0, opens_at REAL, closes_at REAL);
+    shuffle INTEGER DEFAULT 0, closed INTEGER DEFAULT 0, opens_at REAL, closes_at REAL,
+    camera INTEGER DEFAULT 0, camera_secs INTEGER DEFAULT 7);
 CREATE TABLE IF NOT EXISTS attempts(
     code TEXT, user_id INTEGER, name TEXT, started REAL,
     finished INTEGER DEFAULT 0, correct INTEGER DEFAULT 0, total INTEGER DEFAULT 0,
     penalties INTEGER DEFAULT 0, score INTEGER DEFAULT 0,
-    answers TEXT DEFAULT '{}', left_at REAL, result TEXT, last_seen REAL, finished_at REAL,
+    answers TEXT DEFAULT '{}', left_at REAL, result TEXT, last_seen REAL, finished_at REAL, face_n INTEGER DEFAULT 0,
     PRIMARY KEY(code, user_id));
 CREATE TABLE IF NOT EXISTS attempts_old(
     code TEXT, user_id INTEGER, name TEXT, started REAL, finished INTEGER, correct INTEGER,
@@ -107,6 +108,9 @@ for _tbl, _col in (
     ("tests", "opens_at REAL"),
     ("tests", "closes_at REAL"),
     ("attempts", "finished_at REAL"),
+    ("tests", "camera INTEGER DEFAULT 0"),
+    ("tests", "camera_secs INTEGER DEFAULT 7"),
+    ("attempts", "face_n INTEGER DEFAULT 0"),
 ):  # eski bazalar uchun yangi ustunlar
     try:
         db.execute(f"ALTER TABLE {_tbl} ADD COLUMN {_col}")
@@ -136,6 +140,12 @@ def get_attempt(code, uid):
 
 def fmt_dt(ts: float) -> str:
     return time.strftime("%d.%m %H:%M", time.gmtime(ts + TZ_OFFSET * 3600))
+
+
+def camera_applies(test, uid) -> bool:
+    """Kamera tekshiruvi shu yechuvchiga tegishlimi? 0: o'chiq, 1: hamma, 2: faqat test egasi (sinov)."""
+    mode = test["camera"] or 0
+    return mode == 1 or (mode == 2 and uid == test["owner_id"])
 
 
 def has_old(code, uid) -> bool:
@@ -463,6 +473,15 @@ def finalize(code: str, uid: int, kicked: bool = False):
     return res, True
 
 
+def pub(res: dict) -> dict:
+    """Yechuvchiga ko'rsatiladigan natija. Test egasi chiqargan odamga javoblar ko'rsatilmaydi."""
+    if not res.get("kicked"):
+        return res
+    out = {k: v for k, v in res.items() if k not in ("wrong", "items")}
+    out.update(wrong=[], items=[], hide_answers=True)
+    return out
+
+
 def fmt_spent(sec: int) -> str:
     m, sc = divmod(max(0, int(sec)), 60)
     return f"{m} daq {sc} s" if m else f"{sc} s"
@@ -473,14 +492,63 @@ def bar(pct: int, n: int = 10) -> str:
     return "▰" * k + "▱" * (n - k)
 
 
-def result_text(r: dict, rank=None) -> str:
+def _imul(a, b):
+    return ((a & 0xFFFFFFFF) * (b & 0xFFFFFFFF)) & 0xFFFFFFFF
+
+
+def _hash_str(st: str) -> int:
+    h = (1779033703 ^ len(st)) & 0xFFFFFFFF
+    for ch in st:
+        h = _imul(h ^ ord(ch), 3432918353)
+        h = ((h << 13) | (h >> 19)) & 0xFFFFFFFF
+    return h
+
+
+def _mulberry(a: int):
+    state = [a & 0xFFFFFFFF]
+
+    def rnd():
+        state[0] = (state[0] + 0x6D2B79F5) & 0xFFFFFFFF
+        a_ = state[0]
+        t = _imul(a_ ^ (a_ >> 15), 1 | a_)
+        t = ((t + _imul(t ^ (t >> 7), 61 | t)) & 0xFFFFFFFF) ^ t
+        return ((t ^ (t >> 14)) & 0xFFFFFFFF) / 4294967296
+
+    return rnd
+
+
+def _shuf(arr, rnd):
+    for i in range(len(arr) - 1, 0, -1):
+        j = int(rnd() * (i + 1))
+        arr[i], arr[j] = arr[j], arr[i]
+    return arr
+
+
+def view_order(test, uid):
+    """Mini App'dagi aralashtirishning aynan nusxasi: (savollar tartibi, {savol: harflar tartibi})."""
+    mode = test["shuffle"] or 0
+    if test["kind"] != "quiz" or not mode or not test["questions"]:
+        return None
+    qd = {x["q"]: x for x in json.loads(test["questions"])}
+    qs = sorted(decode_key(test["answer_key"]).keys())
+    rnd = _mulberry(_hash_str(f"{test['code']}:{uid}"))
+    seq = list(qs)
+    _shuf(seq, rnd)
+    perm = {}
+    for q in qs:
+        letters = list(qd[q]["o"].keys()) if q in qd else ["a", "b", "c", "d"]
+        perm[q] = _shuf(letters[:], rnd) if mode >= 2 else letters
+    return seq, perm
+
+
+def result_text(r: dict, rank=None, test=None, uid=None) -> str:
     total = r["total"]
     pct = round(r["score"] / total * 100) if total else 0
     t = (
         f"📊 <b>{html.escape(r['title'])}</b>\n\n"
         f"{bar(pct)}  <b>{pct}%</b>\n\n"
         f"✅ To'g'ri javoblar: <b>{r['correct']}/{total}</b>\n"
-        f"🚪 Chiqib ketish jarimasi: -{r['penalties']}\n"
+        f"🚪 Jarima: -{r['penalties']}\n"
         f"🏆 Yakuniy ball: <b>{r['score']}</b>\n"
     )
     if r.get("spent") is not None:
@@ -488,13 +556,25 @@ def result_text(r: dict, rank=None) -> str:
     if rank and rank[0]:
         t += f"📈 Hozirgi reyting: <b>{rank[0]}-o'rin</b> ({rank[1]} kishidan)\n"
     if r.get("kicked"):
-        t += "🚫 Test egasi tomonidan tugatildi\n"
+        return t + "🚫 Test egasi tomonidan tugatildi\n🔒 Javoblar ko'rsatilmaydi"
     w = r["wrong"]
     if w:
-        lines = [
-            f"{x['q']}) siz: {(x['given'] or '—').upper()} → to'g'ri: {x['right'].upper()}"
-            for x in w[:60]
-        ]
+        vo = view_order(test, uid) if test is not None else None
+        if vo:
+            seq, perm = vo
+
+            def dl(q, l):
+                if not l:
+                    return "—"
+                return chr(97 + perm[q].index(l)).upper() if q in perm and l in perm[q] else l.upper()
+
+            rows = sorted((seq.index(x["q"]) + 1, dl(x["q"], x["given"]), dl(x["q"], x["right"])) for x in w)
+            lines = [f"{n}) siz: {g} → to'g'ri: {rt}" for n, g, rt in rows[:60]]
+        else:
+            lines = [
+                f"{x['q']}) siz: {(x['given'] or '—').upper()} → to'g'ri: {x['right'].upper()}"
+                for x in w[:60]
+            ]
         t += "\n❌ <b>Xatolar:</b>\n" + "\n".join(lines)
         if len(w) > 60:
             t += f"\n... va yana {len(w) - 60} ta"
@@ -531,7 +611,8 @@ async def conclude(bot: Bot, code: str, uid: int, prefix: str = "", kicked: bool
     if new:
         try:
             await bot.send_message(
-                uid, prefix + result_text(res, rank_of(code, uid)), reply_markup=review_kb(code)
+                uid, prefix + result_text(res, rank_of(code, uid), get_test(code), uid),
+                reply_markup=None if kicked else review_kb(code),
             )
         except Exception:
             pass
@@ -623,7 +704,10 @@ async def api_start(request):
     att = get_attempt(code, uid)
     if att and att["finished"]:
         res, _ = finalize(code, uid)
-        return web.json_response({"finished": True, "result": res, "kind": test["kind"], "qdata": qdata_for(test), "shuffle": test["shuffle"] or 0, "seed": f"{code}:{uid}"})
+        return web.json_response({"finished": True, "result": pub(res), "kind": test["kind"], "qdata": None if res.get("kicked") else qdata_for(test), "shuffle": test["shuffle"] or 0, "seed": f"{code}:{uid}"})
+
+    if camera_applies(test, uid) and not d.get("cam"):
+        raise web.HTTPConflict(text="Kamera tekshiruvi o'tmagan. Ilovani yopib, qayta oching.")
 
     new = att is None
     if new:
@@ -648,7 +732,7 @@ async def api_start(request):
     left = time_left(test, att)
     if left <= 0:
         res = await conclude(bot, code, uid, "⌛ Vaqt tugadi.\n\n")
-        return web.json_response({"finished": True, "result": res, "kind": test["kind"], "qdata": qdata_for(test), "shuffle": test["shuffle"] or 0, "seed": f"{code}:{uid}"})
+        return web.json_response({"finished": True, "result": pub(res), "kind": test["kind"], "qdata": None if res.get("kicked") else qdata_for(test), "shuffle": test["shuffle"] or 0, "seed": f"{code}:{uid}"})
     if new:
         asyncio.create_task(timer_task(bot, code, uid, left))
 
@@ -695,6 +779,8 @@ async def api_file(request):
     test, att = get_test(code), get_attempt(code, uid)
     if not test or not att:
         raise web.HTTPForbidden(text="Ruxsat yo'q")
+    if att["finished"] and att["result"] and json.loads(att["result"]).get("kicked"):
+        raise web.HTTPForbidden(text="Ruxsat yo'q")  # chiqarilgan odamga test qayta ochilmaydi
     data = await get_file_bytes(request.app["bot"], test)
     return web.Response(body=data, content_type="application/octet-stream")
 
@@ -753,7 +839,7 @@ async def api_back(request):
         raise web.HTTPNotFound(text="Topilmadi")
     if att["finished"]:
         res, _ = finalize(code, uid)
-        return web.json_response({"finished": True, "result": res})
+        return web.json_response({"finished": True, "result": pub(res)})
 
     pen, penalized = att["penalties"], False
     if att["left_at"]:
@@ -770,7 +856,7 @@ async def api_back(request):
     left = time_left(test, att)
     if left <= 0:
         res = await conclude(request.app["bot"], code, uid, "⌛ Vaqt tugadi.\n\n")
-        return web.json_response({"finished": True, "result": res})
+        return web.json_response({"finished": True, "result": pub(res)})
     return web.json_response(
         {"finished": False, "penalties": pen * PENALTY, "penalized": penalized, "left": left}
     )
@@ -783,7 +869,7 @@ async def api_submit(request):
     if not get_test(code) or not get_attempt(code, uid):
         raise web.HTTPNotFound(text="Topilmadi")
     res = await conclude(request.app["bot"], code, uid)
-    return web.json_response({"result": res})
+    return web.json_response({"result": pub(res)})
 
 
 async def api_sync(request):
@@ -796,12 +882,59 @@ async def api_sync(request):
         raise web.HTTPNotFound(text="Topilmadi")
     if att["finished"]:
         res, _ = finalize(code, uid)
-        return web.json_response({"finished": True, "result": res})
+        return web.json_response({"finished": True, "result": pub(res)})
     left = time_left(test, att)
     if left <= 0:
         res = await conclude(request.app["bot"], code, uid, "⌛ Vaqt tugadi.\n\n")
-        return web.json_response({"finished": True, "result": res})
+        return web.json_response({"finished": True, "result": pub(res)})
     return web.json_response({"finished": False, "left": left})
+
+
+async def api_info(request):
+    """Testni boshlamasdan oldin: kamera kerakmi? (urinish yaratilmaydi)"""
+    d = await read_body(request)
+    uid, _ = auth(d)
+    code = str(d.get("code", "")).upper()
+    test = get_test(code)
+    if not test:
+        raise web.HTTPNotFound(text="Test topilmadi")
+    att = get_attempt(code, uid)
+    return web.json_response(
+        {
+            "title": test["title"],
+            "minutes": test["minutes"],
+            "camera": camera_applies(test, uid),
+            "camera_secs": test["camera_secs"] or 7,
+            "pilot": (test["camera"] or 0) == 2,
+            "finished": bool(att and att["finished"]),
+            "block": None if att else start_block(test, uid),
+        }
+    )
+
+
+FACE_LAST = {}
+
+
+async def api_face(request):
+    """Yuz ko'rinmaganda: -1 ball. Video yuborilmaydi, faqat signal."""
+    d = await read_body(request)
+    uid, _ = auth(d)
+    code = str(d.get("code", "")).upper()
+    test, att = get_test(code), get_attempt(code, uid)
+    if not test or not att or att["finished"] or not camera_applies(test, uid):
+        raise web.HTTPConflict(text="expired")
+    key, now = (code, uid), time.time()
+    if now - FACE_LAST.get(key, 0) < 5:  # takroriy signalni e'tiborsiz qoldiradi
+        return web.json_response({"penalties": att["penalties"] * PENALTY})
+    FACE_LAST[key] = now
+    db.execute(
+        "UPDATE attempts SET penalties=penalties+1, face_n=face_n+1 WHERE code=? AND user_id=?",
+        (code, uid),
+    )
+    db.commit()
+    touch(code, uid)
+    att = get_attempt(code, uid)
+    return web.json_response({"penalties": att["penalties"] * PENALTY})
 
 
 async def health(request):
@@ -828,6 +961,8 @@ def make_web(bot: Bot) -> web.Application:
             web.post("/api/back", api_back),
             web.post("/api/submit", api_submit),
             web.post("/api/sync", api_sync),
+            web.post("/api/info", api_info),
+            web.post("/api/face", api_face),
         ]
     )
     return app
@@ -926,6 +1061,13 @@ main{padding-bottom:90px}
 .rverdict{font-weight:700;font-size:18px}
 .rsub{opacity:.8;font-size:14px;margin-top:4px}
 .rtiles{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:14px 0}
+.rtiles.three{grid-template-columns:repeat(3,1fr)}
+.camwrap{width:min(250px,70%);aspect-ratio:3/4;margin:14px auto;border-radius:22px;overflow:hidden;border:3px solid #4db35a;background:#000;box-shadow:0 8px 24px var(--qshadow)}
+.camwrap video,.camprev video{width:100%;height:100%;object-fit:cover;transform:scaleX(-1)}
+.camprev{position:fixed;right:12px;bottom:12px;width:84px;height:112px;border-radius:16px;overflow:hidden;border:3px solid #4db35a;background:#000;z-index:25;box-shadow:0 6px 18px rgba(0,0,0,.35)}
+.camprev.bad{border-color:#e53935;animation:pulse 1s infinite}
+.camprev b{position:absolute;left:0;right:0;bottom:0;background:rgba(229,57,53,.9);color:#fff;font-size:12px;text-align:center;padding:2px 0}
+body.cam .qwrap{padding-bottom:150px}
 .tile{background:var(--qcard);border-radius:16px;padding:12px 4px;text-align:center;box-shadow:0 6px 16px var(--qshadow);animation:pop .5s ease both}
 .tile:nth-child(2){animation-delay:.08s}
 .tile:nth-child(3){animation-delay:.16s}
@@ -1008,16 +1150,28 @@ footer{position:fixed;left:0;right:0;bottom:0;background:var(--bg);border-top:1p
     <div class="rverdict" id="r-verdict"></div>
     <div class="rsub" id="r-sub"></div>
   </div>
-  <div class="rtiles">
+  <div class="rtiles" id="r-tiles">
     <div class="tile"><span>✅</span><b id="r-ok">0</b><i>To'g'ri</i></div>
     <div class="tile"><span>❌</span><b id="r-bad">0</b><i>Xato</i></div>
-    <div class="tile"><span>⬜</span><b id="r-none">0</b><i>Javobsiz</i></div>
+    <div class="tile" id="t-none"><span>⬜</span><b id="r-none">0</b><i>Javobsiz</i></div>
     <div class="tile"><span>🏆</span><b id="r-score">0</b><i>Ball</i></div>
   </div>
-  <div class="rpen hidden" id="r-penbox">🚪 Chiqib ketish jarimasi: <b id="r-pen"></b></div>
+  <div class="rpen hidden" id="r-penbox">🚪 Jarima (ilovadan chiqish, kamera): <b id="r-pen"></b></div>
   <div class="rsec hidden" id="r-wrongbox"><div class="rh">❌ Xatolar</div><div id="r-wrong"></div></div>
   <button class="big grad" id="revbtn">🔍 Xatolarni tahlil qilish</button>
   <button class="big ghost" id="closebtn">Yopish</button>
+</div>
+
+<div id="s-cam" class="hidden qwrap">
+  <div class="rhero">
+    <div class="rtitle" id="c-title"></div>
+    <div style="font-size:42px;margin:6px 0">📷</div>
+    <div class="rverdict">Kamera kerak</div>
+    <div class="rsub" id="c-text" style="line-height:1.5"></div>
+  </div>
+  <div class="camwrap hidden" id="c-vwrap"><video id="c-video" playsinline muted autoplay></video></div>
+  <div class="qwarn" id="c-status" style="text-align:center;margin:12px 0"></div>
+  <button class="big grad" id="c-btn">📷 Kamerani yoqish</button>
 </div>
 
 <div id="s-rev" class="hidden">
@@ -1036,6 +1190,8 @@ footer{position:fixed;left:0;right:0;bottom:0;background:var(--bg);border-top:1p
     <div id="rv-doc" class="hidden"><div id="doc2" class="docwrap"><div class="center" style="color:#666">Fayl yuklanmoqda...</div></div></div>
   </main>
 </div>
+
+<div id="camprev" class="camprev hidden"><video id="m-video" playsinline muted autoplay></video><b id="m-badge" class="hidden"></b></div>
 
 <div id="toast" class="hidden"></div>
 
@@ -1067,7 +1223,7 @@ async function api(path, extra) {
   return r.json();
 }
 function show(name) {
-  ["load", "test", "quiz", "res", "rev"].forEach(n => $("s-" + n).classList.toggle("hidden", n !== name));
+  ["load", "test", "quiz", "cam", "res", "rev"].forEach(n => $("s-" + n).classList.toggle("hidden", n !== name));
 }
 function toast(t) {
   const el = $("toast"); el.textContent = t; el.classList.remove("hidden");
@@ -1085,7 +1241,7 @@ function confetti() {
     setTimeout(() => { if (sp.remove) sp.remove(); }, 4200);
   }
 }
-function fatal(msg) { $("s-load").textContent = "❌ " + msg; }
+function fatal(msg) { $("s-load").textContent = "❌ " + msg; show("load"); }
 function fmt(s) {
   s = Math.max(0, Math.floor(s));
   return String(Math.floor(s / 60)).padStart(2, "0") + ":" + String(s % 60).padStart(2, "0");
@@ -1218,6 +1374,7 @@ function chipEl(cls, txt) {
 }
 function showResult(r) {
   finished = true;
+  stopCam();
   RES = r;
   try { tg.disableClosingConfirmation(); } catch (e) {}
   ensureOrder();
@@ -1237,8 +1394,12 @@ function showResult(r) {
   }, 60);
   const wrong = r.wrong || [];
   const none = wrong.filter(x => !x.given).length;
+  const hide = !!(r.kicked || r.hide_answers);   // chiqarilgan odamga javoblar ko'rsatilmaydi
+  $("t-none").classList.toggle("hidden", hide);
+  $("r-tiles").classList.toggle("three", hide);
+  $("revbtn").classList.toggle("hidden", hide);
   $("r-ok").textContent = r.correct;
-  $("r-bad").textContent = wrong.length - none;
+  $("r-bad").textContent = hide ? Math.max(0, total - r.correct) : wrong.length - none;
   $("r-none").textContent = none;
   $("r-score").textContent = r.score;
   $("r-verdict").textContent = pct === 100 ? "Mukammal! 🏆" : pct >= 80 ? "Ajoyib natija! 🎉" : pct >= 60 ? "Yaxshi natija 👍" :
@@ -1247,7 +1408,7 @@ function showResult(r) {
   $("r-penbox").classList.toggle("hidden", !(r.penalties > 0));
   $("r-pen").textContent = "-" + r.penalties;
   const w = $("r-wrong"); w.innerHTML = "";
-  $("r-wrongbox").classList.toggle("hidden", wrong.length === 0);
+  $("r-wrongbox").classList.toggle("hidden", hide || wrong.length === 0);
   const disp = (q, l) => {
     if (!l) return "—";
     const i = (isQuiz() && PERM[q]) ? PERM[q].indexOf(l) : -1;
@@ -1479,6 +1640,7 @@ function goAway(viaBeacon) {
 async function comeBack() {
   if (!away || finished || !S) return;
   away = false;
+  CAM.lastSeen = Date.now();   // ilovadan qaytgach yuz hisobi qaytadan boshlanadi
   await Promise.race([leaveP, new Promise(r => setTimeout(r, 1500))]);
   try {
     const r = await api("/api/back");
@@ -1493,11 +1655,122 @@ window.addEventListener("pagehide", () => goAway(true));
 tg.onEvent("deactivated", () => goAway(false));
 tg.onEvent("activated", comeBack);
 
+/* ---- Kamera: yuz ko'rinib turishini telefonning o'zi tekshiradi (video yuborilmaydi) ---- */
+const MP_VER = "0.10.14";
+const MP_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@" + MP_VER;
+const MP_MODEL = "https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite";
+let CAM = {stream: null, detector: null, secs: 7, lastSeen: 0, absent: false, busy: false, timer: 0, on: false};
+async function loadDetector() {
+  if (window.__camTest) return window.__camTest;   // faqat sinov uchun
+  try {
+    const mp = await import(MP_BASE + "/vision_bundle.mjs");
+    const files = await mp.FilesetResolver.forVisionTasks(MP_BASE + "/wasm");
+    const make = delegate => mp.FaceDetector.createFromOptions(files, {
+      baseOptions: {modelAssetPath: MP_MODEL, delegate: delegate}, runningMode: "VIDEO", minDetectionConfidence: 0.5
+    });
+    let det;
+    try { det = await make("GPU"); } catch (e) { det = await make("CPU"); }
+    return {count: async v => det.detectForVideo(v, performance.now()).detections.length};
+  } catch (e) {
+    if (window.FaceDetector) {
+      const fd = new window.FaceDetector({fastMode: true, maxDetectedFaces: 2});
+      return {count: async v => (await fd.detect(v)).length};
+    }
+    throw e;
+  }
+}
+function camError(e) {
+  const n = e && e.name;
+  if (n === "NotAllowedError" || n === "SecurityError") return "Kameraga ruxsat berilmadi. Telefon sozlamalarida Telegram uchun kameraga ruxsat bering va qayta urining.";
+  if (n === "NotFoundError" || n === "OverconstrainedError") return "Kamera topilmadi.";
+  if (n === "NotReadableError") return "Kamera band. Uni ishlatayotgan boshqa ilovani yoping va qayta urining.";
+  return "Kamera yoki yuz aniqlash modeli yuklanmadi (internetni tekshiring). " + ((e && e.message) || "");
+}
+function setCamStatus(t) { $("c-status").textContent = t; }
+function camSetup(info) {
+  return new Promise(resolve => {
+    CAM.secs = info.camera_secs || 7;
+    $("c-title").textContent = info.title;
+    $("c-text").textContent = "Bu testda yechuvchi kadrda ko'rinib turishi kerak. Kamera tasviri telefoningizdan chiqmaydi, yozib olinmaydi va test egasiga ko'rsatilmaydi: yuzni telefonning o'zi tekshiradi. " +
+      CAM.secs + " soniya ketma-ket yuz ko'rinmasa, -1 ball ayriladi." + (info.pilot ? " (Sinov rejimi: kamera faqat test egasi uchun yoqilgan.)" : "");
+    show("cam");
+    const btn = $("c-btn");
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        setCamStatus("📷 Kamera yoqilmoqda...");
+        CAM.stream = await navigator.mediaDevices.getUserMedia({video: {facingMode: "user"}, audio: false});
+        const v = $("c-video"); v.srcObject = CAM.stream; $("c-vwrap").classList.remove("hidden");
+        try { await v.play(); } catch (e) {}
+        setCamStatus("⏳ Yuz aniqlash modeli yuklanmoqda (bir necha soniya)...");
+        CAM.detector = await loadDetector();
+      } catch (e) {
+        setCamStatus("❌ " + camError(e));
+        btn.disabled = false; btn.textContent = "🔄 Qayta urinish";
+        return;
+      }
+      setCamStatus("🙂 Yuzingizni kadrga qo'ying...");
+      let ok = 0, tries = 0;
+      const tid = setInterval(async () => {
+        if (CAM.busy) return;
+        CAM.busy = true;
+        let n = 0;
+        try { n = await CAM.detector.count($("c-video")); } catch (e) {}
+        CAM.busy = false;
+        ok = n > 0 ? ok + 1 : 0; tries++;
+        if (ok >= 3) { clearInterval(tid); setCamStatus("✅ Yuz aniqlandi"); resolve(); }
+        else if (tries === 40) setCamStatus("Yuz aniqlanmayapti. Yorug'roq joyda, telefonni yuz oldida tuting.");
+      }, 500);
+    };
+  });
+}
+function startCamLoop() {
+  CAM.on = true; CAM.lastSeen = Date.now(); CAM.absent = false;
+  document.body.classList.add("cam");
+  $("m-video").srcObject = CAM.stream;
+  try { $("m-video").play(); } catch (e) {}
+  $("camprev").classList.remove("hidden");
+  CAM.timer = setInterval(camTick, 500);
+}
+async function camTick() {
+  if (!CAM.on || finished || away || CAM.busy) return;
+  CAM.busy = true;
+  let n = 1;
+  try {
+    const tr = CAM.stream && CAM.stream.getVideoTracks()[0];
+    n = (tr && tr.readyState === "live") ? await CAM.detector.count($("m-video")) : 0;
+  } catch (e) { n = 1; }   // aniqlagich xato bersa, noto'g'ri jarima bermaymiz
+  CAM.busy = false;
+  const now = Date.now();
+  if (n > 0) { CAM.lastSeen = now; CAM.absent = false; }
+  const gap = (now - CAM.lastSeen) / 1000;
+  $("camprev").classList.toggle("bad", gap > 2);
+  $("m-badge").classList.toggle("hidden", !(gap > 2));
+  $("m-badge").textContent = "⏱ " + Math.max(0, Math.ceil(CAM.secs - gap)) + " s";
+  if (gap >= CAM.secs && !CAM.absent) { CAM.absent = true; reportAbsent(); }
+}
+async function reportAbsent() {
+  haptic("warning"); toast("📷 Yuz ko'rinmadi: -1 ball");
+  try { const r = await api("/api/face"); setPen(r.penalties); } catch (e) {}
+}
+function stopCam() {
+  CAM.on = false;
+  if (CAM.timer) { clearInterval(CAM.timer); CAM.timer = 0; }
+  try { if (CAM.stream) CAM.stream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  CAM.stream = null;
+  document.body.classList.remove("cam");
+  $("camprev").classList.add("hidden");
+}
+
 /* ---- Boshlash ---- */
 (async function init() {
   if (!INIT || !CODE) { fatal("Bu sahifani Telegram bot orqali oching."); return; }
-  try { S = await api("/api/start"); } catch (e) { fatal(e.message); return; }
-  if (S.finished) { showResult(S.result); return; }
+  let info = {camera: false};
+  try { info = await api("/api/info"); } catch (e) { fatal(e.message); return; }
+  if (info.block) { fatal(info.block); return; }
+  if (info.camera && !info.finished) await camSetup(info);
+  try { S = await api("/api/start", {cam: !!info.camera}); } catch (e) { stopCam(); fatal(e.message); return; }
+  if (S.finished) { stopCam(); showResult(S.result); return; }
   answers = S.answers || {};
   $("title").textContent = S.title;
   setPen(S.penalties);
@@ -1516,6 +1789,7 @@ tg.onEvent("activated", comeBack);
     } catch (e) {}
   }, 15000);
   if (!isQuiz()) loadDoc();
+  if (info.camera) startCamLoop();
 })();
 </script>
 </body></html>
@@ -1751,8 +2025,8 @@ async def show_test(m: Message, code: str):
     if att and att["finished"]:
         res, _ = finalize(code, uid)
         return await m.answer(
-            "Siz bu testni allaqachon yechib bo'lgansiz.\n\n" + result_text(res),
-            reply_markup=review_kb(code),
+            "Siz bu testni allaqachon yechib bo'lgansiz.\n\n" + result_text(res, None, test, uid),
+            reply_markup=None if res.get("kicked") else review_kb(code),
         )
     if not att:
         block = start_block(test, uid)
@@ -1839,9 +2113,10 @@ def active_view(code: str, note: str = ""):
         else:
             st = "⚪️ aloqa yo'q"
         pen = f" | jarima -{r['penalties'] * PENALTY}" if r["penalties"] else ""
+        cam = f" | 📷 {r['face_n']}×" if r["face_n"] else ""
         lines.append(
             f"• <b>{html.escape(name)}</b> — {st}\n"
-            f"   ⏱ {fmt_left(time_left(test, r))} | ✍️ {done}/{total}{pen}"
+            f"   ⏱ {fmt_left(time_left(test, r))} | ✍️ {done}/{total}{pen}{cam}"
         )
         kb.append([InlineKeyboardButton(text=f"❌ {name[:24]}", callback_data=f"kick:{code}:{r['user_id']}")])
     if len(rows) > MAX_SHOWN:
@@ -1982,7 +2257,8 @@ HELP_TEXT = (
     "🗓 /jadval KOD 20.11 20:00 21:00 — ochiq turish vaqti (o'chirish: /jadval KOD off)\n"
     "🔀 /aralash KOD 0|1|2 — 0: o'chiq, 1: savollar, 2: savollar va variantlar\n"
     "🔁 /qayta KOD — kimgadir qayta yechishga ruxsat\n"
-    "📄 /nusxa KOD — testdan yangi kodli nusxa"
+    "📄 /nusxa KOD — testdan yangi kodli nusxa\n"
+    "📷 /kamera KOD on|off|sinov [soniya] — yechuvchi kadrda ko'rinishini tekshirish"
 )
 
 
@@ -2023,7 +2299,7 @@ async def export_cmd(m: Message, command: CommandObject):
         return await m.answer("Hali hech kim yechmagan.")
     buf = io.StringIO()
     w = csv.writer(buf, delimiter=";")
-    w.writerow(["№", "Ism", "To'g'ri", "Jami", "Foiz", "Jarima", "Ball", "Holat", "Boshlagan", "Tugatgan", "Sarflangan (daq)"])
+    w.writerow(["№", "Ism", "To'g'ri", "Jami", "Foiz", "Jarima", "Ball", "Holat", "Boshlagan", "Tugatgan", "Sarflangan (daq)", "Kamera (marta)"])
     for i, a in enumerate(rows, 1):
         res = json.loads(a["result"]) if a["result"] else {}
         if a["finished"]:
@@ -2031,9 +2307,9 @@ async def export_cmd(m: Message, command: CommandObject):
             pct = round(a["score"] / a["total"] * 100) if a["total"] else 0
             spent = round((a["finished_at"] - a["started"]) / 60, 1) if a["finished_at"] else ""
             row = [a["correct"], a["total"], pct, a["penalties"] * PENALTY, a["score"], holat,
-                   fmt_dt(a["started"]), fmt_dt(a["finished_at"]) if a["finished_at"] else "", spent]
+                   fmt_dt(a["started"]), fmt_dt(a["finished_at"]) if a["finished_at"] else "", spent, a["face_n"] or 0]
         else:
-            row = ["", "", "", a["penalties"] * PENALTY, "", "yechmoqda", fmt_dt(a["started"]), "", ""]
+            row = ["", "", "", a["penalties"] * PENALTY, "", "yechmoqda", fmt_dt(a["started"]), "", "", a["face_n"] or 0]
         w.writerow([i, csv_safe(a["name"])] + row)
     data = ("\ufeff" + buf.getvalue()).encode("utf-8")
     await m.answer_document(
@@ -2127,10 +2403,11 @@ async def copy_cmd(m: Message, command: CommandObject, bot: Bot):
     code, test, _ = r
     new = new_code()
     db.execute(
-        "INSERT INTO tests(code,owner_id,title,file_id,kind,answer_key,minutes,created,body,questions,shuffle) "
-        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        "INSERT INTO tests(code,owner_id,title,file_id,kind,answer_key,minutes,created,body,questions,shuffle,camera,camera_secs) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (new, test["owner_id"], (test["title"] + " (nusxa)")[:100], test["file_id"], test["kind"],
-         test["answer_key"], test["minutes"], time.time(), test["body"], test["questions"], test["shuffle"] or 0),
+         test["answer_key"], test["minutes"], time.time(), test["body"], test["questions"], test["shuffle"] or 0,
+         test["camera"] or 0, test["camera_secs"] or 7),
     )
     db.commit()
     me = await bot.get_me()
@@ -2175,6 +2452,46 @@ async def schedule_cmd(m: Message, command: CommandObject):
     await m.answer(
         f"🗓 <b>{html.escape(test['title'])}</b>\nOchiladi: {fmt_dt(start)}\nYopiladi: {fmt_dt(end)}\n"
         f"(vaqt UTC+{TZ_OFFSET:g} bo'yicha). Yopilgandan keyin yangi yechuvchilar kira olmaydi."
+    )
+
+
+CAMERA_MODES = {"off": 0, "on": 1, "sinov": 2}
+
+
+def camera_status(test) -> str:
+    mode, secs = test["camera"] or 0, test["camera_secs"] or 7
+    if mode == 0:
+        return "📷 Kamera tekshiruvi: o'chiq"
+    who = "hamma yechuvchi uchun" if mode == 1 else "faqat siz (test egasi) yechganingizda — sinov rejimi"
+    return f"📷 Kamera tekshiruvi: yoqiq ({who}). {secs} soniya ketma-ket yuz ko'rinmasa, -1 ball."
+
+
+@router.message(Command("kamera"))
+async def camera_cmd(m: Message, command: CommandObject):
+    r = await own_test(m, command, "/kamera KOD on|off|sinov [soniya]")
+    if not r:
+        return
+    code, test, rest = r
+    if not rest:
+        return await m.answer(
+            camera_status(test) + "\n\nO'zgartirish: <code>/kamera KOD on|off|sinov [soniya]</code>\n"
+            "• <b>sinov</b> — faqat siz uchun (boshqalarga kamera so'ralmaydi)\n"
+            "• <b>on</b> — hamma yechuvchi uchun\n• <b>off</b> — o'chiq"
+        )
+    mode = CAMERA_MODES.get(rest[0].lower())
+    if mode is None:
+        return await m.answer("Ishlatish: <code>/kamera KOD on|off|sinov [soniya]</code>")
+    secs = test["camera_secs"] or 7
+    if len(rest) > 1:
+        if not rest[1].isdigit() or not 3 <= int(rest[1]) <= 120:
+            return await m.answer("Soniya 3 dan 120 gacha bo'lsin. Masalan: <code>/kamera KOD sinov 20</code>")
+        secs = int(rest[1])
+    db.execute("UPDATE tests SET camera=?, camera_secs=? WHERE code=?", (mode, secs, code))
+    db.commit()
+    await m.answer(
+        camera_status(get_test(code))
+        + "\n\nYechuvchiga test oldidan ogohlantirish chiqadi: video telefondan chiqmaydi, saqlanmaydi va "
+        "sizga ko'rsatilmaydi, faqat \"yuz ko'rinmadi\" signali yuboriladi."
     )
 
 
